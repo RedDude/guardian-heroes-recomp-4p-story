@@ -4,8 +4,9 @@
 //   GlobalWork 0x829CBBA8: +0x14 pad_kind[12] (player -> pad, -1 = empty), +0x2c join flag.
 //   Story work 0x829CBFE8 (sub_82495B30): +i*0x24 party block i (+0 EXP, +0xc u16, +0xe level),
 //     +0x3d8+i party kind (s8, -1 = none), +(slot+0xd1)*8 character registry (weak handles).
-//   The story only uses party 0..2 (0 = AI ally, 1 = P1, 2 = P2); the arrays hold 12 entries, so
-//   P3/P4 live in registry slots 30/31 (kind at work+0x3d8+30/31, party block 10/11).
+//   The story only uses party 0..2 (0 = AI ally, 1 = P1, 2 = P2). P3/P4 live in the hero slots 3/4
+//   (kind at work+0x3d8+3/4, party block 3/4) and take the place of their hero's story NPC; with
+//   GH_4P_HEROSLOT=0 they use slots 30/31 (party block 10/11) and the NPC copies stay.
 //
 // Features:
 //   * Join: an unassigned pad pressing START while P2 exists runs the game's own "P2 joins" flow
@@ -157,17 +158,35 @@ int MaxPlayers() {
 // Extra players
 // ---------------------------------------------------------------------------------------------
 
-uint32_t SlotFor(int p) {  // registry slot of player p (2 = P3, 3 = P4)
+// P3/P4 take the place of their hero's story NPC (as P1/P2 do) unless GH_4P_HEROSLOT=0.
+bool HeroSlots() {
+  static int v = -1;
+  if (v < 0) { const char* s = std::getenv("GH_4P_HEROSLOT"); v = (s && *s == '0') ? 0 : 1; }
+  return v == 1;
+}
+
+// Registry slot of player p (2 = P3, 3 = P4). The story keeps slots 1..5 for the five heroes and the
+// stage scripts keep per-actor state in arrays of 24 entries indexed by slot, so a P3/P4 that stands
+// in for a hero in cut scenes must sit in a hero slot: 3/4 (the NPC heroes then use the free one).
+// Without hero slots, 30/31 (never used by the stages).
+uint32_t SlotFor(int p) {
   const char* es = Env(p == 2 ? "GH_4P_SLOT2" : "GH_4P_SLOT3");
-  return es ? (uint32_t)std::atoi(es) : (p == 2 ? 30u : 31u);
+  if (es) return (uint32_t)std::atoi(es);
+  if (HeroSlots()) return p == 2 ? 3u : 4u;
+  return p == 2 ? 30u : 31u;
 }
 // The game indexes work+0x3d8 (kind, 32 entries) by registry slot ("is the character in slot s a party
 // member?"; stage scripts ask it for the NPC heroes in slots 3..5), and the party blocks
 // work+i*0x24 (12 entries) by slot too. P3/P4 keep their kind at their own slots (30/31) and their
 // block at 10/11 (no hero ever uses slots 6..11); see the shadow block hooks below.
 inline uint32_t KindOf(int p) { return kKinds + SlotFor(p); }
-inline uint32_t BlockOf(int p) { return kWork + (p == 2 ? 10u : 11u) * kBlock; }
+// Party block: the slot's own block when the slot has one (0..11), else 10/11.
+inline uint32_t BlockOf(int p) {
+  const uint32_t slot = SlotFor(p);
+  return kWork + (slot < 12 ? slot : (p == 2 ? 10u : 11u)) * kBlock;
+}
 
+uint32_t g_stage;  // stage object (seen in sub_824E2AC0)
 int g_kind[4] = {-1, -1, -1, -1};  // kind spawned this stage for P3/P4 (diagnostics, hero slots)
 
 // First pad not assigned to P1..P4 (or -1).
@@ -493,6 +512,13 @@ void LogPlayers(uint8_t* base) {
                         (int32_t)R32(base, ch + 0xC) >> 16, (int16_t)R16(base, ch + 0xCA),
                         R8(base, ch + 0xDF), Deref(base, ch + 0x174) ? " ai" : "");
   }
+  // During events: the stage scripts' per-actor state (stage+0x170dc+slot*4) and counter (+0x1713c).
+  if (g_stage && R8(base, kWork + 0x3b4)) {
+    line += " | acts";
+    for (uint32_t s = 0; s < 13; s++)
+      line += fmt::format(" {}:{}/{}", s, (int32_t)R32(base, g_stage + 0x170dc + s * 4),
+                          (int32_t)R32(base, g_stage + 0x1713c + s * 4));
+  }
   REXKRNL_INFO("{}", line);
 }
 
@@ -697,21 +723,38 @@ REX_HOOK_RAW(sub_82498808) {
 }
 
 // The story keeps one registry slot per hero (kinds 1..5) in stage+0x1719c+(kind-1)*4: the party
-// member's slot when that hero is played, else a free slot 1..5 where the story spawns the hero as an
-// NPC. Opt-in (GH_4P_HEROSLOT=1) pointing the heroes of P3/P4 at their slots: the story scripts then
-// drive that character in cut scenes (seen: stage 1 turned P4's Ginjirou into an NPC).
+// member's slot when that hero is played (sub_82496990 only looks at P1/P2), else the first free
+// slot 1..5, where the story spawns the hero as an NPC that leaves when the stage starts. The scripts
+// ask work+0x3d8+slot ("is it a party member?") before driving or removing that character, so
+// pointing the heroes of P3/P4 at their slots makes them take the NPC's place, as for P1/P2; the
+// heroes nobody plays get the hero slots left over. GH_4P_HEROSLOT=0 keeps the NPC copies.
 REX_HOOK_RAW(sub_824E2AC0) {
   const uint32_t stage = ctx.r3.u32;
   __imp__sub_824E2AC0(ctx, base);
-  const char* hs = Env("GH_4P_HEROSLOT");
-  if (!Enabled() || !(hs && *hs == '1')) return;
-  for (int p = 2; p < 4; p++) {
-    int k = g_kind[p];
+  g_stage = stage;
+  if (!Enabled() || !HeroSlots()) return;
+  int owner[6] = {0, 0, 0, 0, 0, 0};  // hero kind -> slot of the player that plays it (0 = NPC)
+  bool used[32] = {};
+  for (uint32_t slot : {1u, 2u, SlotFor(2), SlotFor(3)}) {
+    int k = S8(base, kKinds + slot);
     if (k == 7) k = 2;
-    if (k >= 1 && k <= 5) {
-      W32(base, stage + 0x1719c + (k - 1) * 4, SlotFor(p));
-      REXKRNL_INFO("story4p: hero {} -> slot {} (P{})", k, SlotFor(p), p + 1);
+    if (k < 1 || k > 5 || !Chara(base, slot) || slot >= 32) continue;
+    owner[k] = (int)slot;
+    used[slot] = true;
+  }
+  if (!owner[1] && !owner[2] && !owner[3] && !owner[4] && !owner[5]) return;
+  for (int k = 1; k <= 5; k++) {
+    const uint32_t at = stage + 0x1719c + (k - 1) * 4;
+    const uint32_t old = R32(base, at);
+    uint32_t slot = (uint32_t)owner[k];
+    if (!slot) {
+      for (uint32_t s = 1; s <= 5; s++)
+        if (!used[s]) { slot = s; break; }
+      if (!slot) slot = old;
+      if (slot < 32) used[slot] = true;
     }
+    W32(base, at, slot);
+    if (slot != old) REXKRNL_INFO("story4p: hero {} slot {} -> {}", k, old, slot);
   }
 }
 
@@ -907,7 +950,7 @@ struct Shadow {
     if (!Enabled() || !ch) return;
     const uint32_t slot = R8(b, ch + 0xDA);
     const int p = slot == SlotFor(2) ? 2 : (slot == SlotFor(3) ? 3 : -1);
-    if (p < 0) return;
+    if (p < 0 || slot < 12) return;  // slots 0..11 have their own block
     base = b;
     region = kWork + slot * kBlock;
     blk = BlockOf(p);
@@ -928,6 +971,8 @@ struct Expose {
   uint8_t old[2];
   Expose(uint8_t* b, uint32_t a0, uint32_t a1) {
     if (!Enabled() || !Story(b)) return;
+    if (SlotFor(2) == a0 && SlotFor(3) == a1) return;  // already there
+    if (SlotFor(2) < 12 && SlotFor(3) < 12 && a0 >= 10) return;  // preloads already see 0..11
     base = b;
     at[0] = a0; at[1] = a1;
     for (int i = 0; i < 2; i++) {
