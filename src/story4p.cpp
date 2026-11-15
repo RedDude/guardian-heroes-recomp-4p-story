@@ -24,10 +24,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -120,6 +123,13 @@ extern "C" REX_FUNC(__imp__sub_8248A1F0);  // top-level mode dispatcher (once pe
 extern "C" REX_FUNC(sub_8249A868);  // reset story work (work)
 extern "C" REX_FUNC(__imp__sub_8249A868);
 extern "C" REX_FUNC(sub_824968F0);  // put hero in party (work, slot, kind): kind + level 1 block
+extern "C" REX_FUNC(__imp__sub_824968F0);
+extern "C" REX_FUNC(__imp__sub_82501690);  // parameter screen panel: read its block (after a join)
+extern "C" REX_FUNC(__imp__sub_82497950);  // restore the party snapshot (owner): load / continue
+extern "C" REX_FUNC(__imp__sub_8249A638);  // write "System Data" (owner snapshot included) if changed
+extern "C" REX_FUNC(__imp__sub_8249B198);  // read "System Data" into the owner
+extern "C" REX_FUNC(__imp__sub_824380D0);  // write a content file (name, ..., buffer, size)
+extern "C" REX_FUNC(__imp__sub_8256E290);  // stage 1 exit: P1/P2 past x 976 walk out (stage)
 extern "C" REX_FUNC(sub_82497898);  // New Game exit step (owner 0x829caaf0)
 extern "C" REX_FUNC(sub_82499F40);  // save party progress (owner, flag)
 extern "C" REX_FUNC(sub_826A3900);  // operator new
@@ -242,6 +252,7 @@ uint32_t g_stage;  // stage object (seen in sub_824E2AC0)
 uint8_t g_npc_home[24];
 int g_kind[4] = {-1, -1, -1, -1};  // kind spawned this stage for P3/P4 (diagnostics, hero slots)
 uint32_t g_cont[2][2];  // P3/P4: continue state, timer (see the sub_824E4308 hook)
+void ClearRoster();     // saved heroes of P2/P3/P4 (see "Progress of P2/P3/P4 across saves")
 
 // First pad not assigned to P1..P4 (or -1).
 int FreePad(uint8_t* base) {
@@ -729,6 +740,7 @@ REX_HOOK_RAW(sub_8249A868) {
   if (!Enabled()) return;
   for (int p = 2; p < 4; p++) W8(base, kPadKind + p, 0xFF);
   std::memset(g_cont, 0, sizeof(g_cont));
+  ClearRoster();  // New Game forgets the saved heroes; a load restores them right after (sub_82497950)
   REXKRNL_INFO("story4p: story work reset, P3/P4 seats cleared");
 }
 
@@ -789,7 +801,7 @@ REX_HOOK_RAW(sub_82500658) {
 // Continue (sub_824E4308(stage), every frame): a downed P1/P2 spends a credit and gets up. It only
 // knows party 1/2 (registry slots 1/2, state words stage+0x171b8/bc, timers +0x171c0/c4), so it is
 // run a second time with P3/P4 swapped into those places. With no credit left the original ends the
-// game; P3/P4 just stay down then.
+// game, for P3/P4 too.
 REX_HOOK_RAW(sub_824E4308) {
   const uint32_t stage = ctx.r3.u32;
   PPCContext saved = ctx;
@@ -815,7 +827,9 @@ REX_HOOK_RAW(sub_824E4308) {
     }
   }
   __imp__sub_824E4308(ctx, base);
-  if (!Enabled() || R8(base, stage + 0x171c8) || R8(base, kWork + 0x3ae) == 0) return;
+  // With no credit left the second run ends the game for a downed P3/P4, as the original does for a
+  // downed P1/P2 (even with the other one up): the original rule, for the four players.
+  if (!Enabled() || R8(base, stage + 0x171c8)) return;
   bool any = false;
   for (int p = 2; p < 4; p++) any |= S8(base, KindOf(p)) >= 0;
   if (!any) return;
@@ -869,8 +883,11 @@ REX_HOOK_RAW(sub_825CF040) {
     W16(base, state + 8, g_idle[p].dir > 0 ? 0x7FFF : 0x8001);       // sThumbLX
     W16(base, state + 10, 0);                                         // sThumbLY
   }
+  // Not on the pad of a player walking on: A is jump, it hopped along instead of walking.
+  bool walking = false;
+  for (int p = 0; p < 4; p++) walking |= g_idle[p].dir && S8(base, kPadKind + p) == (int8_t)pad;
   const char* menus = Env("GH_AI_MENUS");  // GH_AI_MENUS=0 turns the tapping off
-  if (everyone && mine && !(menus && *menus == '0') && polls % 40 < 3)
+  if (everyone && mine && !walking && !(menus && *menus == '0') && polls % 40 < 3)
     W16(base, state + 4, R16(base, state + 4) | 0x1000);  // XINPUT_GAMEPAD_A
   // GH_SKIP_TALK=1 (tests): while an event/dialogue runs (work+0x3b4), P1's pad taps BACK (skip
   // the scene) and A (next line), alternately, whatever the AI setting.
@@ -882,6 +899,92 @@ REX_HOOK_RAW(sub_825CF040) {
     else if (ph >= 30 && ph < 33) W16(base, state + 4, R16(base, state + 4) | 0x1000);  // A
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Progress of P2/P3/P4 across saves (per hero)
+// ---------------------------------------------------------------------------------------------
+// The save keeps P1 (and P2's block), but loading empties the P2 seat; whoever joins with START
+// gets a fresh block (level = P1's / 2, no points spent: sub_82501D98 state 4). P3/P4 are not in the
+// save at all. The blocks of the heroes played by P2/P3/P4 are kept here, per hero, following the
+// game's own snapshot (owner+0x1014, taken by sub_82499F40 and restored by sub_82497950) and its
+// disk file (sub_8249A638 writes, sub_8249B198 reads): file gh4p_party.bin in the user data folder.
+// A player who joins with a hero that has a block gets it back (when its level is not below the fresh
+// one). New Game (sub_8249A868 then a snapshot) forgets them. GH_4P_KEEP=0 turns this off.
+namespace {
+
+struct Roster {
+  uint8_t has[6] = {};             // by hero 1..5 (Han 7 -> 2)
+  uint8_t block[6][kBlock] = {};
+};
+Roster g_snap;    // mirrors the game's snapshot (what the next disk save writes)
+Roster g_roster;  // live: restored from the snapshot, waiting for their heroes to join again
+Roster g_disk;    // last content written to / read from the file
+uint32_t g_fresh;  // block just set up by sub_824968F0 (0 = none)
+
+bool KeepProgress() {
+  static int v = -1;
+  if (v < 0) { const char* s = Env("GH_4P_KEEP"); v = (s && *s == '0') ? 0 : 1; }
+  return v == 1 && Enabled();
+}
+
+int HeroKey(int kind) { return kind == 7 ? 2 : (kind >= 1 && kind <= 5 ? kind : 0); }
+
+std::filesystem::path RosterPath() {
+  rex::Runtime* rt = rex::Runtime::instance();
+  return (rt ? rt->user_data_root() : std::filesystem::path(".")) / "gh4p_party.bin";
+}
+
+std::string RosterText(const Roster& r) {
+  std::string s;
+  for (int k = 1; k <= 5; k++)
+    if (r.has[k]) s += fmt::format(" hero {} lv {}", k, r.block[k][0xe]);
+  return s.empty() ? " (empty)" : s;
+}
+
+void WriteRoster() {
+  if (!std::memcmp(&g_disk, &g_snap, sizeof(Roster))) return;
+  const auto path = RosterPath();
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (!f) { REXKRNL_WARN("story4p: cannot write {}", path.string()); return; }
+  f.write("GH4P", 4);
+  f.write(reinterpret_cast<const char*>(&g_snap), sizeof(Roster));
+  g_disk = g_snap;
+  REXKRNL_INFO("story4p: party progress saved:{}", RosterText(g_snap));
+}
+
+void ReadRoster() {
+  g_snap = Roster{};
+  const auto path = RosterPath();
+  std::ifstream f(path, std::ios::binary);
+  char magic[4] = {};
+  Roster r;
+  if (f && f.read(magic, 4) && !std::memcmp(magic, "GH4P", 4) &&
+      f.read(reinterpret_cast<char*>(&r), sizeof(Roster)))
+    g_snap = r;
+  g_disk = g_snap;
+  g_roster = g_snap;
+  REXKRNL_INFO("story4p: party progress loaded:{}", RosterText(g_snap));
+}
+
+void ClearRoster() { g_roster = Roster{}; }
+
+// After the game's snapshot: the heroes of P2/P3/P4 now, plus those still waiting in the roster.
+void TakeSnapshot(uint8_t* base) {
+  g_snap = g_roster;
+  struct Seat { uint32_t kind, blk; };
+  const Seat seats[3] = {{kKinds + 2, kWork + 2 * kBlock}, {KindOf(2), BlockOf(2)}, {KindOf(3), BlockOf(3)}};
+  for (const Seat& s : seats) {
+    const int k = HeroKey(S8(base, s.kind));
+    if (!k) continue;
+    g_snap.has[k] = 1;
+    std::memcpy(g_snap.block[k], base + s.blk, kBlock);
+  }
+  const int p1 = HeroKey(S8(base, kKinds + 1));
+  if (p1) g_snap.has[p1] = 0;  // P1's hero is in the game's own save
+  g_roster = g_snap;
+}
+
+}  // namespace
 
 // End of stage / checkpoint: keep P3/P4 level and EXP in their party blocks.
 REX_HOOK_RAW(sub_82499F40) {
@@ -897,6 +1000,102 @@ REX_HOOK_RAW(sub_82499F40) {
     }
   }
   __imp__sub_82499F40(ctx, base);
+  g_fresh = 0;
+  if (KeepProgress() && !g_join.active) TakeSnapshot(base);
+}
+
+// Snapshot restored (save loaded, continue after a game over): the saved heroes wait for their players.
+REX_HOOK_RAW(sub_82497950) {
+  __imp__sub_82497950(ctx, base);
+  if (!KeepProgress()) return;
+  g_roster = g_snap;
+  REXKRNL_INFO("story4p: party progress restored:{}", RosterText(g_roster));
+}
+
+// "System Data" written (r4 != 0: reset to defaults, the snapshot is gone too). The function returns
+// early when nothing changed; the file is only written when it reaches the content write
+// (sub_824380D0), so gh4p_party.bin follows the save on disk.
+bool g_save_write;
+REX_HOOK_RAW(sub_824380D0) {
+  g_save_write = true;
+  __imp__sub_824380D0(ctx, base);
+}
+
+REX_HOOK_RAW(sub_8249A638) {
+  const bool reset = ctx.r4.u32 & 0xff;
+  g_save_write = false;
+  __imp__sub_8249A638(ctx, base);
+  if (!KeepProgress() || !g_save_write) return;
+  if (reset) g_snap = Roster{};
+  WriteRoster();
+}
+
+REX_HOOK_RAW(sub_8249B198) {
+  __imp__sub_8249B198(ctx, base);
+  if (KeepProgress()) ReadRoster();
+}
+
+// A hero put in the party: remember the block for the panel that shows it next (the join).
+REX_HOOK_RAW(sub_824968F0) {
+  const uint32_t blk = ctx.r3.u32 + ctx.r4.u32 * kBlock;
+  __imp__sub_824968F0(ctx, base);
+  g_fresh = blk;
+}
+
+// Parameter screen panel reads its block: right after a join (sub_82501D98 state 4: fresh block,
+// level = P1's / 2), a saved block of the same hero replaces it.
+REX_HOOK_RAW(sub_82501690) {
+  const uint32_t panel = ctx.r3.u32;
+  const uint32_t seat = R32(base, panel + 0x818);
+  const uint32_t blk = kWork + (seat + 1) * kBlock;
+  if (KeepProgress() && g_fresh && g_fresh == blk && seat < 2) {
+    const int k = HeroKey(S8(base, kKinds + 1 + seat));
+    if (k && g_roster.has[k] && k != HeroKey(S8(base, kKinds + 1))) {
+      const uint8_t* saved = g_roster.block[k];
+      if (saved[0xe] >= R8(base, blk + 0xe)) {
+        std::memcpy(base + blk, saved, kBlock);
+        int spent = 0;
+        for (uint32_t a = 0x15; a <= 0x1a; a++) spent += saved[a];
+        REXKRNL_INFO("story4p: hero {} joins with its saved block (level {}, points spent {})", k, saved[0xe],
+                     spent);
+      } else {
+        REXKRNL_INFO("story4p: hero {} saved level {} below the fresh {}: not used", k, saved[0xe],
+                     R8(base, blk + 0xe));
+      }
+    }
+  }
+  g_fresh = 0;
+  __imp__sub_82501690(ctx, base);
+}
+
+// End of stage 1 (sub_8256E290(stage), every frame): P1/P2 past x 976 get the "walk out" brain 0x31
+// and lose their player/team fields; once both are out the stage ends (stage+0x15180). P3/P4 do the
+// same past x 976, and any still in walk out with them when the stage ends (only looks; the end still
+// waits only for P1/P2).
+REX_HOOK_RAW(sub_8256E290) {
+  const uint32_t stage = ctx.r3.u32;
+  const PPCContext saved = ctx;
+  // stage+0x15180 also holds the opening scene's object; the exit test only runs while it is 0, and
+  // the stage ends when this call sets it.
+  const bool testing = R32(base, stage + 0x15180) == 0;
+  __imp__sub_8256E290(ctx, base);
+  if (!Enabled() || !Story(base) || !testing) return;
+  const bool ending = R32(base, stage + 0x15180) != 0;
+  Guest g(const_cast<PPCContext&>(saved), base);
+  for (int p = 2; p < 4; p++) {
+    if (S8(base, KindOf(p)) < 0) continue;
+    const uint32_t ch = Chara(base, SlotFor(p));
+    if (!ch || S8(base, ch + 0xE0) != p || R16(base, ch + 0xCA) > 0x7fff) continue;
+    const int32_t x = (int32_t)R32(base, ch + 0xC);
+    if (!ending && (x <= 0x3cfffff || R8(base, ch + 0x55))) continue;
+    g(sub_82479E60, ch, 0x31);
+    W8(base, ch + 0xDE, 0xFF);
+    W8(base, ch + 0xDD, 0xFF);
+    W8(base, ch + 0xE0, 0xFF);
+    W8(base, ch + 0x140, 0);
+    if (g_brain[p]) g_brain[p] = 0;
+    REXKRNL_INFO("story4p: stage 1 exit: P{} walks out (x {}{})", p + 1, x >> 16, ending ? ", stage ending" : "");
+  }
 }
 
 // Stage scripts only move the hero slots 1..5 in cut scenes; P3/P4 stay where they spawned (often
@@ -938,6 +1137,25 @@ REX_HOOK_RAW(sub_82498808) {
     Guest g(ctx, base);
     UpdateAi(g);
     AutoDebug(base);
+    // GH_4P_DOWN=34 (tests): every GH_4P_DOWN_SECS (default 20) s of play, those players (1..4) are
+    // downed through the game's own death (HP -1, vtable +0x2d8), as when they land after a hit.
+    if (const char* dl = Env("GH_4P_DOWN")) {
+      static uint32_t played;
+      const char* ds = Env("GH_4P_DOWN_SECS");
+      const uint32_t every = (ds ? std::atoi(ds) : 20) * 60;
+      if (!R8(base, kWork + 0x3b4) && Story(base) && ++played % every == 0)
+        for (; *dl; dl++) {
+          const int p = *dl - '1';
+          if (p < 0 || p > 3) continue;
+          const uint32_t ch = FindPlayer(base, p);
+          if (!ch || R16(base, ch + 0xCA) > 0x7fff) continue;
+          PPCFunc* fn = rex::runtime::ResolveIndirectFunction(R32(base, R32(base, ch) + 0x2d8));
+          if (!fn) continue;
+          W16(base, ch + 0xCA, 0xFFFF);
+          g(fn, ch);
+          REXKRNL_INFO("story4p: debug: P{} downed (credits {})", p + 1, R8(base, kWork + 0x3ae));
+        }
+    }
     LogPlayers(base);
   }
   __imp__sub_82498808(ctx, base);
@@ -1016,8 +1234,16 @@ REX_HOOK_RAW(sub_8249CC40) {
   if (n < 3) return;
   const uint32_t ch = Deref(base, panel + 0x18);
   if (!ch || R8(base, ch + 0xDC) != 1) return;
-  const int p = S8(base, ch + 0xE0);
-  if (p < 0 || p > 3) return;
+  int p = S8(base, ch + 0xE0);
+  if (p < 0 || p > 3) {
+    // Walking out at the end of stage 1 (sub_8256E290 clears +0xe0): find the player by its slot, or
+    // its panel would jump to the original layout for the last frames of the stage.
+    const uint32_t slot = R8(base, ch + 0xDA);
+    p = slot == 1 ? 0 : slot == 2 ? 1 : -1;
+    for (int q = 2; q < 4 && p < 0; q++)
+      if (slot == SlotFor(q) && S8(base, KindOf(q)) >= 0) p = q;
+    if (p < 0) return;
+  }
   // Panel = portrait + bars, ~225 px wide; same 278 px pitch as P1/P2, centred on the 1280 screen.
   static const float x4[4] = {110, 388, 666, 944}, x3[4] = {250, 528, 806, 944};
   WF(base, panel + 0x888, n >= 4 ? x4[p] : x3[p]);
@@ -1036,9 +1262,25 @@ REX_HOOK_RAW(sub_8249D2C0) {
 }
 
 // "Credit(s) N" (up to 3 quads counted in +0x130): nothing to draw while credits are infinite.
+// With finite credits and 3+ players the counter sat on P4's panel: it goes to the bottom right
+// corner for the call (+0x84 right edge x, +0x88 y of the counter; the quads are built from them).
 REX_HOOK_RAW(sub_8247FE88) {
   const uint32_t obj = ctx.r3.u32;
+  const bool lower = Enabled() && !InfiniteCredits() && Story(base) && PartyPlayers(base) >= 3;
+  const uint32_t y = R32(base, obj + 0x88);
+  if (lower) {
+    static bool logged;
+    if (!logged) {
+      logged = true;
+      float fx, fy; uint32_t x = R32(base, obj + 0x84);
+      std::memcpy(&fx, &x, 4); std::memcpy(&fy, &y, 4);
+      REXKRNL_INFO("story4p: credits counter at x {} y {}: moved to the bottom", fx, fy);
+    }
+    const char* cy = Env("GH_4P_CREDITS_Y");
+    WF(base, obj + 0x88, cy ? (float)std::atof(cy) : 650.0f);
+  }
   __imp__sub_8247FE88(ctx, base);
+  if (lower) W32(base, obj + 0x88, y);
   if (Enabled() && InfiniteCredits() && Story(base)) W32(base, obj + 0x130, 0);
 }
 
