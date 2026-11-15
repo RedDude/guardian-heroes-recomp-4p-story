@@ -48,8 +48,8 @@ extern "C" REX_FUNC(__imp__sub_82498808);   // camera update (once per frame in 
 extern "C" REX_FUNC(__imp__sub_82500658);   // parameter screen: next/previous hero index
 extern "C" REX_FUNC(__imp__sub_824892C0);   // modes 5/6: parameter screen
 extern "C" REX_FUNC(__imp__sub_824D0EF8);   // route choice menu constructor
-extern "C" REX_FUNC(__imp__sub_824D3EC8);   // stage prop placed (r4 = object, +0x188 layout)
-extern "C" REX_FUNC(__imp__sub_824D3AF8);   // stage prop placed (r4 = object, +0x17c layout)
+extern "C" REX_FUNC(__imp__sub_82443478);   // stage prop base constructor (r3 = object)
+extern "C" REX_FUNC(__imp__sub_82443F28);   // stage prop base constructor, 0x8200E570 family
 extern "C" REX_FUNC(__imp__sub_82443550);   // prop destructor (vtables 0x8200E0B0..0x8200E530)
 extern "C" REX_FUNC(__imp__sub_82443FF8);   // prop destructor (vtables 0x8200E570/0x8200E5B0)
 extern "C" REX_FUNC(__imp__sub_82489160);   // mode 4: New Game screen
@@ -551,21 +551,28 @@ struct Idle {
   uint32_t target = 0;    // breakable prop being hit while walking (0 = none)
   uint32_t target_since = 0;
   uint32_t jump_until = 0;  // jumping over a prop that did not break (frame)
+  int flips = 0;          // turns without the camera scrolling
+  int32_t jump_x0 = 0, jump_top = 0;  // diagnostics
 } g_idle[4];
 
 // Breakable stage props (barrels, crates, stools...): placed by sub_824D3EC8/sub_824D3AF8, removed by
 // their destructors. Breakable = vtable 0x8200E0F0..0x8200E4F0 or 0x8200E5B0 (the classes that set
 // HP; 0x8200E0B0/0x8200E570 are fixed scenery, 0x8200E530 are pickups), HP at +0xCA.
-constexpr int kMaxProps = 128;
-uint32_t g_props[kMaxProps];
-uint32_t g_props_skip[kMaxProps];  // props given up on (could not be broken)
+constexpr int kMaxProps = 512;
+uint32_t g_props[kMaxProps];       // every stage prop object (filtered by vtable when used)
+uint32_t g_props_skip[kMaxProps];  // frame until which a prop is left alone (jumped over)
+
+// Shared walking direction (+1 right, -1 left): the way that scrolled the camera last, for every AI
+// player. Back to right on each new stage.
+int g_way = 1;
 
 bool BreakableVt(uint32_t vt) {
   return (vt >= 0x8200E0F0 && vt <= 0x8200E4F0 && (vt & 0x3F) == 0x30) || vt == 0x8200E5B0;
 }
 
 void AddProp(uint8_t* base, uint32_t obj) {
-  if (!obj || !BreakableVt(R32(base, obj))) return;
+  (void)base;
+  if (!obj) return;
   for (uint32_t& o : g_props) if (o == obj) return;
   for (int i = 0; i < kMaxProps; i++)
     if (!g_props[i]) { g_props[i] = obj; g_props_skip[i] = 0; return; }
@@ -580,8 +587,8 @@ void RemoveProp(uint32_t obj) {
 uint32_t PropAhead(uint8_t* base, int32_t x, int32_t z, int dir) {
   for (int i = 0; i < kMaxProps; i++) {
     const uint32_t o = g_props[i];
-    if (!o || g_props_skip[i]) continue;
-    if (!BreakableVt(R32(base, o))) { g_props[i] = 0; continue; }  // freed and reused
+    if (!o || g_props_skip[i] > g_frame) continue;
+    if (!BreakableVt(R32(base, o))) continue;
     if ((int16_t)R16(base, o + 0xCA) <= 0) continue;
     const int32_t ox = (int32_t)R32(base, o + 0xC) >> 16, oz = (int32_t)R32(base, o + 0x14) >> 16;
     const int32_t ahead = (ox - x) * dir;
@@ -592,7 +599,7 @@ uint32_t PropAhead(uint8_t* base, int32_t x, int32_t z, int dir) {
 
 void SkipProp(uint32_t obj) {
   for (int i = 0; i < kMaxProps; i++)
-    if (g_props[i] == obj) g_props_skip[i] = 1;
+    if (g_props[i] == obj) g_props_skip[i] = g_frame + 180;  // 3 s, then hit it again if still there
 }
 
 int IdleSeconds() {
@@ -637,6 +644,9 @@ bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
   const int secs = IdleSeconds();
   const int32_t x = (int32_t)R32(base, ch + 0xC) >> 16;
   const int32_t cam = (int32_t)R32(base, kCamera + 0x304) >> 16;
+  static int way_stage = -1;
+  const int stage = R8(base, kWork + 0x3af);
+  if (stage != way_stage) { way_stage = stage; g_way = 1; }
   if (secs <= 0 || R8(base, kWork + 0x3b4) || !Story(base)) {
     if (w.dir) StopWalk(p, "event");
     w.anchor = x;
@@ -646,21 +656,30 @@ bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
   if (!w.dir) {
     if (x < w.anchor - 32 || x > w.anchor + 32) { w.anchor = x; w.since = g_frame; return false; }
     if (g_frame - w.since < (uint32_t)secs * 60 || EnemyInView(base)) return false;
-    w.dir = 1;
+    w.dir = g_way;
     w.dir_since = g_frame;
     w.cam = cam;
     w.scrolled = false;
-    REXKRNL_INFO("story4p: AI P{} idle {} s at x {}: walking right", p + 1, secs, x);
+    w.flips = 0;
+    REXKRNL_INFO("story4p: AI P{} idle {} s at x {}: walking {}", p + 1, secs, x, w.dir > 0 ? "right" : "left");
     return true;
   }
   if (EnemyInView(base)) { StopWalk(p, "enemy in view"); w.anchor = x; return false; }
-  // A breakable prop in the way: stop and hit it (the pad taps X, see the pad hook) until it breaks;
-  // after 4 s it is left alone. The walk timers wait meanwhile.
+  if (w.dir != g_way) {  // another player found the way: follow it
+    w.dir = g_way;
+    w.dir_since = g_frame;
+    w.cam = cam;
+    w.scrolled = false;
+    w.target = 0;
+  }
+  // A breakable prop in the way: stop and hit it (the pad taps X, see the pad hook). If it is still
+  // there after 1 s, jump over it; it is left alone for 3 s, then hit again if it is still in the way.
+  // The walk timers wait meanwhile.
   if (w.target && (!BreakableVt(R32(base, w.target)) || (int16_t)R16(base, w.target + 0xCA) <= 0)) {
     REXKRNL_INFO("story4p: AI P{} broke the prop", p + 1);
     w.target = 0;
   }
-  if (!w.target) {
+  if (!w.target && w.jump_until <= g_frame) {
     const int32_t z = (int32_t)R32(base, ch + 0x14) >> 16;
     if (uint32_t o = PropAhead(base, x, z, w.dir)) {
       w.target = o;
@@ -670,7 +689,7 @@ bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
     }
   }
   if (w.target) {
-    if (g_frame - w.target_since > 60) {  // 1 s without breaking it: jump over it and go on
+    if (g_frame - w.target_since > 60) {
       REXKRNL_INFO("story4p: AI P{} jumps over the prop", p + 1);
       SkipProp(w.target);
       w.target = 0;
@@ -681,22 +700,37 @@ bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
       return true;
     }
   }
+  if (w.jump_until > g_frame) {
+    w.dir_since = g_frame;  // the jump is not "walking without scrolling"
+    const int32_t y = (int32_t)R32(base, ch + 0x10) >> 16;
+    if (w.jump_until == g_frame + 44) { w.jump_x0 = x; w.jump_top = y; }
+    if (y < w.jump_top) w.jump_top = y;
+    if (w.jump_until == g_frame + 1)
+      REXKRNL_INFO("story4p: AI P{} jump: x {} -> {}, height {}, st {:02x}", p + 1, w.jump_x0, x, -w.jump_top,
+                   R8(base, ch + 0xDF));
+  }
   if (cam > w.cam + 8 || cam < w.cam - 8) {  // the camera follows: keep going while it scrolls
     w.cam = cam;
     w.dir_since = g_frame;
     w.scrolled = true;
+    w.flips = 0;
+    if (g_way != w.dir) REXKRNL_INFO("story4p: way is now {} (P{})", w.dir > 0 ? "right" : "left", p + 1);
+    g_way = w.dir;
   }
   const uint32_t held = g_frame - w.dir_since;
-  if (w.dir > 0 && held >= 180) {
+  if (held >= 180) {
     if (w.scrolled) { StopWalk(p, "camera stopped"); w.anchor = x; return false; }
-    w.dir = -1;
+    if (++w.flips > 1) {
+      StopWalk(p, "neither way scrolled");
+      g_way = 1;
+      w.anchor = x;
+      return false;
+    }
+    g_way = -w.dir;  // shared: everyone turns
+    w.dir = g_way;
     w.dir_since = g_frame;
     w.cam = cam;
-    REXKRNL_INFO("story4p: AI P{} right did not scroll: walking left", p + 1);
-  } else if (w.dir < 0 && held >= 240) {
-    StopWalk(p, w.scrolled ? "camera stopped" : "left did not scroll either");
-    w.anchor = x;
-    return false;
+    REXKRNL_INFO("story4p: AI P{} did not scroll: everyone walks {}", p + 1, w.dir > 0 ? "right" : "left");
   }
   return true;
 }
@@ -975,12 +1009,14 @@ REX_HOOK_RAW(sub_825CF040) {
       W16(base, state + 10, 0);
       continue;
     }
-    uint16_t b = R16(base, state + 4) & ~0x000Cu;
-    // Jumping over a prop: A for the first frames of the jump (A = jump), direction held throughout.
-    if (g_idle[p].jump_until > g_frame && g_idle[p].jump_until - g_frame > 33) b |= 0x1000;
+    uint16_t b = R16(base, state + 4) & ~0x000Fu;
+    // Jumping over a prop: UP is jump in this game (A only hops); held for the first frames of the
+    // jump, direction held throughout.
+    const bool up = g_idle[p].jump_until > g_frame && g_idle[p].jump_until - g_frame > 30;
+    if (up) b |= 0x0001;                                               // DPAD_UP
     W16(base, state + 4, b | (g_idle[p].dir > 0 ? 0x0008 : 0x0004));  // DPAD_RIGHT / DPAD_LEFT
     W16(base, state + 8, g_idle[p].dir > 0 ? 0x7FFF : 0x8001);       // sThumbLX
-    W16(base, state + 10, 0);                                         // sThumbLY
+    W16(base, state + 10, up ? 0x7FFF : 0);                           // sThumbLY
   }
   // Not on the pad of a player walking on: A is jump, it hopped along instead of walking.
   bool walking = false;
@@ -2201,14 +2237,16 @@ REX_HOOK_RAW(sub_824D0EF8) {
 }
 
 // Breakable props: keep the list used by the walking AI (UpdateIdle).
-REX_HOOK_RAW(sub_824D3EC8) {
-  const uint32_t obj = ctx.r4.u32;
-  __imp__sub_824D3EC8(ctx, base);
+// Every stage prop goes through one of the two base constructors (the subclasses call them first),
+// whether the stage table (sub_824D4A48) or a stage script creates it.
+REX_HOOK_RAW(sub_82443478) {
+  const uint32_t obj = ctx.r3.u32;
+  __imp__sub_82443478(ctx, base);
   AddProp(base, obj);
 }
-REX_HOOK_RAW(sub_824D3AF8) {
-  const uint32_t obj = ctx.r4.u32;
-  __imp__sub_824D3AF8(ctx, base);
+REX_HOOK_RAW(sub_82443F28) {
+  const uint32_t obj = ctx.r3.u32;
+  __imp__sub_82443F28(ctx, base);
   AddProp(base, obj);
 }
 REX_HOOK_RAW(sub_82443550) {
