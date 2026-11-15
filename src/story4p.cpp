@@ -118,6 +118,7 @@ extern "C" REX_FUNC(__imp__sub_825CB1F0);
 extern "C" REX_FUNC(__imp__sub_825CD678);
 extern "C" REX_FUNC(__imp__sub_8248A1F0);  // top-level mode dispatcher (once per frame)
 extern "C" REX_FUNC(sub_8249A868);  // reset story work (work)
+extern "C" REX_FUNC(__imp__sub_8249A868);
 extern "C" REX_FUNC(sub_824968F0);  // put hero in party (work, slot, kind): kind + level 1 block
 extern "C" REX_FUNC(sub_82497898);  // New Game exit step (owner 0x829caaf0)
 extern "C" REX_FUNC(sub_82499F40);  // save party progress (owner, flag)
@@ -240,6 +241,7 @@ uint32_t g_stage;  // stage object (seen in sub_824E2AC0)
 // NPC hero moved by sub_824E2AC0's hook: g_npc_home[new slot] = original slot (0 = not moved).
 uint8_t g_npc_home[24];
 int g_kind[4] = {-1, -1, -1, -1};  // kind spawned this stage for P3/P4 (diagnostics, hero slots)
+uint32_t g_cont[2][2];  // P3/P4: continue state, timer (see the sub_824E4308 hook)
 
 // First pad not assigned to P1..P4 (or -1).
 int FreePad(uint8_t* base) {
@@ -504,15 +506,113 @@ void ReportLost(uint8_t* base, int p) {
                R8(base, kWork + 0x3b4), s.ch, s.slot, s.hp, s.x, s.st, s.brain ? " ai" : "", what);
 }
 
+// ---------------------------------------------------------------------------------------------
+// AI players standing still: walk them on
+// ---------------------------------------------------------------------------------------------
+// The hero brains only fight; with no enemy in view they stand where they are, and many stages only
+// go on when the players walk right (the camera scrolls and the next wave comes). An AI player that
+// stays within a few pixels for GH_AI_IDLE seconds (default 5) with no enemy in view walks right on
+// its pad (brain released meanwhile). If the camera does not scroll in 3 s, it walks left instead
+// (stages that go left) for up to 4 s. It hands back to the brain when an enemy shows up, when the
+// camera stops after having scrolled, or when the time runs out. GH_AI_IDLE=0 turns it off.
+struct Idle {
+  int32_t anchor = 0;     // x (pixels) where the player was last seen moving
+  uint32_t since = 0;     // frame when it got there
+  int dir = 0;            // +1 walking right, -1 left, 0 = brain
+  uint32_t dir_since = 0;
+  int32_t cam = 0;        // camera centre when the walk started / last scrolled
+  bool scrolled = false;
+} g_idle[4];
+
+int IdleSeconds() {
+  static int v = -2;
+  if (v == -2) { const char* s = Env("GH_AI_IDLE"); v = s ? std::atoi(s) : 5; }
+  return v;
+}
+
+// An enemy (another team than P1, alive, not a player) inside the camera window.
+bool EnemyInView(uint8_t* base) {
+  uint32_t p1 = 0;
+  for (uint32_t s = 0; s < 32 && !p1; s++) {
+    uint32_t ch = Chara(base, s);
+    if (ch && R8(base, ch + 0xDC) == 1) p1 = ch;
+  }
+  if (!p1) return false;
+  const int8_t team = S8(base, p1 + 0xDE);
+  const int32_t wl = (int32_t)R32(base, kCamera + 0x318), wr = (int32_t)R32(base, kCamera + 0x31C);
+  for (uint32_t s = 0; s < 32; s++) {
+    uint32_t ch = Chara(base, s);
+    if (!ch || R8(base, ch + 0xDC)) continue;
+    const int8_t t = S8(base, ch + 0xDE);
+    if (t == team || t == -1 || (int16_t)R16(base, ch + 0xCA) <= 0) continue;
+    const int32_t x = (int32_t)R32(base, ch + 0xC);
+    if (x >= wl && x <= wr) return true;
+  }
+  return false;
+}
+
+void StopWalk(int p, const char* why) {
+  if (g_idle[p].dir) REXKRNL_INFO("story4p: AI P{} walk stops ({})", p + 1, why);
+  g_idle[p].dir = 0;
+  g_idle[p].since = g_frame;
+  g_retry[p] = 0;
+}
+
+// Per frame for an AI player that is up; returns true while it walks (pad-driven).
+bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
+  Idle& w = g_idle[p];
+  const int secs = IdleSeconds();
+  const int32_t x = (int32_t)R32(base, ch + 0xC) >> 16;
+  const int32_t cam = (int32_t)R32(base, kCamera + 0x304) >> 16;
+  if (secs <= 0 || R8(base, kWork + 0x3b4) || !Story(base)) {
+    if (w.dir) StopWalk(p, "event");
+    w.anchor = x;
+    w.since = g_frame;
+    return false;
+  }
+  if (!w.dir) {
+    if (x < w.anchor - 32 || x > w.anchor + 32) { w.anchor = x; w.since = g_frame; return false; }
+    if (g_frame - w.since < (uint32_t)secs * 60 || EnemyInView(base)) return false;
+    w.dir = 1;
+    w.dir_since = g_frame;
+    w.cam = cam;
+    w.scrolled = false;
+    REXKRNL_INFO("story4p: AI P{} idle {} s at x {}: walking right", p + 1, secs, x);
+    return true;
+  }
+  if (EnemyInView(base)) { StopWalk(p, "enemy in view"); w.anchor = x; return false; }
+  if (cam > w.cam + 8 || cam < w.cam - 8) {  // the camera follows: keep going while it scrolls
+    w.cam = cam;
+    w.dir_since = g_frame;
+    w.scrolled = true;
+  }
+  const uint32_t held = g_frame - w.dir_since;
+  if (w.dir > 0 && held >= 180) {
+    if (w.scrolled) { StopWalk(p, "camera stopped"); w.anchor = x; return false; }
+    w.dir = -1;
+    w.dir_since = g_frame;
+    w.cam = cam;
+    REXKRNL_INFO("story4p: AI P{} right did not scroll: walking left", p + 1);
+  } else if (w.dir < 0 && held >= 240) {
+    StopWalk(p, w.scrolled ? "camera stopped" : "left did not scroll either");
+    w.anchor = x;
+    return false;
+  }
+  return true;
+}
+
 void UpdateAi(Guest& g) {
   uint8_t* base = g.base;
   for (int p = 0; p < 4; p++) {
     uint32_t slot = 0;
     uint32_t ch = FindPlayer(base, p, &slot);
     if (!ch) {
+      // During events the players read +0xdc = 0 and are not found; the brain we attached stays on
+      // the character, so g_brain is kept (it used to be cleared here, and a downed AI player then
+      // kept a brain we no longer recognised: the game removed it like an NPC).
       if (g_seen[p].ch) ReportLost(base, p);
       g_seen[p].ch = 0;
-      g_brain[p] = 0;
+      if (g_idle[p].dir) StopWalk(p, "player not found");
       continue;
     }
     g_seen[p] = {ch, slot, (int16_t)R16(base, ch + 0xCA), (int32_t)R32(base, ch + 0xC) >> 16,
@@ -520,17 +620,38 @@ void UpdateAi(Guest& g) {
     uint32_t brain = Deref(base, ch + 0x174);
     // HP (+0xca) below zero = down. The game's continue (sub_824E4308) skips characters with a
     // brain, and a downed character with a brain is removed like an NPC: hand it back to its pad
-    // until the continue has revived it.
+    // until the continue has revived it. Any brain goes (also one the stage put on it).
     const bool down = R16(base, ch + 0xCA) > 0x7fff;
+    static int downlog = -1;
+    if (downlog < 0) downlog = Env("GH_4P_DOWNLOG") ? 1 : 0;
+    if (downlog && down && g_stage) {
+      // The state the continue tests (vtable +0x1c), through a guest call.
+      PPCFunc* fn = rex::runtime::ResolveIndirectFunction(R32(base, R32(base, ch) + 0x1c));
+      const uint32_t st = fn ? g(fn, ch) : 0xFFFF;
+      const int seat = p < 2 ? p : p - 2;
+      REXKRNL_INFO("story4p: down P{} f{} hp {} st {:#x} df {:02x} 140 {:02x} 4e {} cont {} {}", p + 1, g_frame,
+                   (int16_t)R16(base, ch + 0xCA), st, R8(base, ch + 0xDF), R8(base, ch + 0x140),
+                   (int16_t)R16(base, ch + 0x4E),
+                   p < 2 ? R32(base, g_stage + 0x171b8 + seat * 4) : g_cont[seat][0],
+                   p < 2 ? R32(base, g_stage + 0x171c0 + seat * 4) : g_cont[seat][1]);
+    }
     if (down) {
-      if (brain && brain == g_brain[p]) {
+      if (brain) {
         g(sub_82479E60, ch, 0);
-        REXKRNL_INFO("story4p: AI P{} down, brain released for the continue", p + 1);
+        REXKRNL_INFO("story4p: P{} down, brain {:08X}{} released for the continue", p + 1, brain,
+                     brain == g_brain[p] ? " (AI)" : "");
       }
       g_brain[p] = 0;
       g_retry[p] = 30;
+      if (g_idle[p].dir) StopWalk(p, "down");
       continue;
     }
+    if (g_ai[p] && UpdateIdle(base, p, ch)) {
+      if (brain && brain == g_brain[p]) g(sub_82479E60, ch, 0);  // the pad drives it meanwhile
+      if (brain == g_brain[p]) g_brain[p] = 0;
+      continue;
+    }
+    if (!g_ai[p] && g_idle[p].dir) StopWalk(p, "AI off");
     if (g_ai[p]) {
       if (brain) continue;  // ours, or a story script is driving this character
       if (g_retry[p] > 0) { g_retry[p]--; continue; }
@@ -600,6 +721,17 @@ REX_HOOK_RAW(sub_824E2970) {
     if (S8(base, KindOf(p)) >= 0) SpawnExtra(g, p);
 }
 
+// Story work reset (New Game, loading a save, continuing after a game over): the kinds go to -1, so
+// P3/P4 leave the party (as P2 does: the snapshot restore sub_82497950 also empties P2's seat); free
+// their pads too, or those pads would stay "taken" and could never join again.
+REX_HOOK_RAW(sub_8249A868) {
+  __imp__sub_8249A868(ctx, base);
+  if (!Enabled()) return;
+  for (int p = 2; p < 4; p++) W8(base, kPadKind + p, 0xFF);
+  std::memset(g_cont, 0, sizeof(g_cont));
+  REXKRNL_INFO("story4p: story work reset, P3/P4 seats cleared");
+}
+
 // Stage "P2 joins" check (stage state 4): with P2 present, a free pad pressing START joins as P3/P4.
 REX_HOOK_RAW(sub_824E3618) {
   const uint32_t stage = ctx.r3.u32;
@@ -623,7 +755,8 @@ REX_HOOK_RAW(sub_824E3618) {
       if (!(g(sub_82421B40) & 0xff)) {
         for (int pad = 0; pad < 4; pad++) {
           bool taken = false;
-          for (int i = 0; i < 4; i++) taken |= S8(base, kPadKind + i) == pad;
+          for (int i = 0; i < 4; i++)  // a P3/P4 pad only counts while that player is in the party
+            taken |= S8(base, kPadKind + i) == pad && (i < 2 || S8(base, KindOf(i)) >= 0);
           if (taken || !(g(sub_82419C38, pad) & 1)) continue;
           if (!(R32(base, g(sub_8241B800, pad)) & 0x400000)) continue;
           REXKRNL_INFO("story4p: pad {} pressed START, joining as P{}", pad, player + 1);
@@ -657,11 +790,30 @@ REX_HOOK_RAW(sub_82500658) {
 // knows party 1/2 (registry slots 1/2, state words stage+0x171b8/bc, timers +0x171c0/c4), so it is
 // run a second time with P3/P4 swapped into those places. With no credit left the original ends the
 // game; P3/P4 just stay down then.
-uint32_t g_cont[2][2];  // P3/P4: continue state, timer
-
 REX_HOOK_RAW(sub_824E4308) {
   const uint32_t stage = ctx.r3.u32;
   PPCContext saved = ctx;
+  if (Enabled()) {
+    // The continue only takes a downed player without a brain; one that finishes falling with a
+    // brain lies down for good and is removed like an NPC. Release the brain here, right before the
+    // continue looks, for every player (found by +0xe0, which also holds during events, when
+    // +0xdc reads 0 and UpdateAi does not see the players).
+    Guest g(saved, base);
+    for (uint32_t s = 1; s < 32; s++) {
+      const uint32_t ch = Chara(base, s);
+      if (!ch) continue;
+      const int8_t p = S8(base, ch + 0xE0);
+      if (p < 0 || p > 3 || R16(base, ch + 0xCA) <= 0x7fff) continue;
+      if (s != 1 && s != 2 && s != SlotFor(2) && s != SlotFor(3)) continue;
+      const uint32_t brain = Deref(base, ch + 0x174);
+      if (!brain) continue;
+      g(sub_82479E60, ch, 0);
+      if (brain == g_brain[p]) g_brain[p] = 0;
+      g_retry[p] = 30;
+      REXKRNL_INFO("story4p: P{} down (event {}), brain {:08X} released before the continue", p + 1,
+                   R8(base, kWork + 0x3b4), brain);
+    }
+  }
   __imp__sub_824E4308(ctx, base);
   if (!Enabled() || R8(base, stage + 0x171c8) || R8(base, kWork + 0x3ae) == 0) return;
   bool any = false;
@@ -708,6 +860,14 @@ REX_HOOK_RAW(sub_825CF040) {
     if (k < 0) continue;
     everyone &= g_ai[p];
     mine |= k == (int8_t)pad && g_ai[p];
+  }
+  // AI players walking on (UpdateIdle): hold the d-pad and the stick on their pad.
+  for (int p = 0; p < 4; p++) {
+    if (!g_idle[p].dir || S8(base, kPadKind + p) != (int8_t)pad) continue;
+    const uint16_t b = R16(base, state + 4) & ~0x000Cu;
+    W16(base, state + 4, b | (g_idle[p].dir > 0 ? 0x0008 : 0x0004));  // DPAD_RIGHT / DPAD_LEFT
+    W16(base, state + 8, g_idle[p].dir > 0 ? 0x7FFF : 0x8001);       // sThumbLX
+    W16(base, state + 10, 0);                                         // sThumbLY
   }
   const char* menus = Env("GH_AI_MENUS");  // GH_AI_MENUS=0 turns the tapping off
   if (everyone && mine && !(menus && *menus == '0') && polls % 40 < 3)
@@ -792,6 +952,7 @@ REX_HOOK_RAW(sub_82498808) {
 REX_HOOK_RAW(sub_824E2AC0) {
   const uint32_t stage = ctx.r3.u32;
   __imp__sub_824E2AC0(ctx, base);
+  if (g_stage != stage) std::memset(g_cont, 0, sizeof(g_cont));  // new stage object: as P1/P2's
   g_stage = stage;
   std::memset(g_npc_home, 0, sizeof(g_npc_home));
   if (!Enabled() || !HeroSlots()) return;
@@ -908,6 +1069,8 @@ void SwapRegistry(uint8_t* base, int i) {  // i = 0 (P3) / 1 (P4)
 void CallExtras(Guest& g, PPCFunc* fn, bool swap) {
   for (int i = 0; i < 2; i++) {
     if (!g_extra[i]) continue;
+    // With three players there is no P4: its slot holds a story NPC, keep its window closed.
+    if (S8(g.base, KindOf(2 + i)) < 0) continue;
     // The window reads kind work+0x3d8+(index+1) and the character in slot index+1.
     const uint8_t k = R8(g.base, kKinds + 3 + i);
     if (swap) { SwapRegistry(g.base, i); W8(g.base, kKinds + 3 + i, R8(g.base, KindOf(2 + i))); }
