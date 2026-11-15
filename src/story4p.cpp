@@ -20,6 +20,7 @@
 //     F5..F8 toggle P1..P4 while the game window has focus.
 //   * The camera (sub_82498808) frames every focus point that players register each frame
 //     (sub_8246B2D8 -> sub_82496BB0), so P3/P4 are framed once they are flagged as on screen.
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +72,53 @@ extern "C" REX_FUNC(__imp__sub_8243E510);  // collects party kinds 0..11 to prel
 extern "C" REX_FUNC(__imp__sub_824EB8D0);  // stage load: collects party kinds 0..11 to preload
 extern "C" REX_FUNC(__imp__sub_8247A530);  // create character from a descriptor (+0 slot, +2 kind)
 extern "C" REX_FUNC(__imp__sub_82418928);  // file buffer alloc (size, heap type) -> XMemAlloc
+extern "C" REX_FUNC(__imp__sub_82570F70);  // stage 2 actor script (stage, slot, hero kind)
+// actor scripts f(stage, slot, hero kind), traced with GH_4P_ACTLOG=1
+extern "C" REX_FUNC(__imp__sub_8256EB60);
+extern "C" REX_FUNC(__imp__sub_82572588);
+extern "C" REX_FUNC(__imp__sub_82576980);
+extern "C" REX_FUNC(__imp__sub_8257BEE0);
+extern "C" REX_FUNC(__imp__sub_825806D8);
+extern "C" REX_FUNC(__imp__sub_82581C00);
+extern "C" REX_FUNC(__imp__sub_825841A0);
+extern "C" REX_FUNC(__imp__sub_82585348);
+extern "C" REX_FUNC(__imp__sub_82587080);
+extern "C" REX_FUNC(__imp__sub_8258A3A0);
+extern "C" REX_FUNC(__imp__sub_8258CD30);
+extern "C" REX_FUNC(__imp__sub_8258F720);
+extern "C" REX_FUNC(__imp__sub_82590FF8);
+extern "C" REX_FUNC(__imp__sub_82593278);
+extern "C" REX_FUNC(__imp__sub_82596758);
+extern "C" REX_FUNC(__imp__sub_82598658);
+extern "C" REX_FUNC(__imp__sub_8259B9B8);
+extern "C" REX_FUNC(__imp__sub_825A3318);
+extern "C" REX_FUNC(__imp__sub_825A6200);
+extern "C" REX_FUNC(__imp__sub_825AA170);
+extern "C" REX_FUNC(__imp__sub_825ACBF8);
+extern "C" REX_FUNC(__imp__sub_825AEFE0);
+extern "C" REX_FUNC(__imp__sub_825B0348);
+extern "C" REX_FUNC(__imp__sub_825B2E88);
+extern "C" REX_FUNC(__imp__sub_825B3748);
+extern "C" REX_FUNC(__imp__sub_825B5098);
+extern "C" REX_FUNC(__imp__sub_825B6AF8);
+extern "C" REX_FUNC(__imp__sub_825B82B8);
+extern "C" REX_FUNC(__imp__sub_825B9860);
+extern "C" REX_FUNC(__imp__sub_825BB090);
+extern "C" REX_FUNC(__imp__sub_825BD690);
+extern "C" REX_FUNC(__imp__sub_825BE8E0);
+extern "C" REX_FUNC(__imp__sub_825C0E98);
+extern "C" REX_FUNC(__imp__sub_825C3948);
+extern "C" REX_FUNC(__imp__sub_825C4C30);
+extern "C" REX_FUNC(__imp__sub_825C6650);
+extern "C" REX_FUNC(__imp__sub_825C74C0);
+extern "C" REX_FUNC(__imp__sub_825C99E8);
+extern "C" REX_FUNC(__imp__sub_825CB1F0);
+extern "C" REX_FUNC(__imp__sub_825CD678);
+extern "C" REX_FUNC(__imp__sub_8248A1F0);  // top-level mode dispatcher (once per frame)
+extern "C" REX_FUNC(sub_8249A868);  // reset story work (work)
+extern "C" REX_FUNC(sub_824968F0);  // put hero in party (work, slot, kind): kind + level 1 block
+extern "C" REX_FUNC(sub_82497898);  // New Game exit step (owner 0x829caaf0)
+extern "C" REX_FUNC(sub_82499F40);  // save party progress (owner, flag)
 extern "C" REX_FUNC(sub_826A3900);  // operator new
 extern "C" REX_FUNC(sub_824B2ED0);  // window base constructor
 extern "C" REX_FUNC(sub_824B57E8);  // status window setup (window, player index), in-stage flavour
@@ -187,6 +235,8 @@ inline uint32_t BlockOf(int p) {
 }
 
 uint32_t g_stage;  // stage object (seen in sub_824E2AC0)
+// NPC hero moved by sub_824E2AC0's hook: g_npc_home[new slot] = original slot (0 = not moved).
+uint8_t g_npc_home[24];
 int g_kind[4] = {-1, -1, -1, -1};  // kind spawned this stage for P3/P4 (diagnostics, hero slots)
 
 // First pad not assigned to P1..P4 (or -1).
@@ -660,6 +710,15 @@ REX_HOOK_RAW(sub_825CF040) {
   const char* menus = Env("GH_AI_MENUS");  // GH_AI_MENUS=0 turns the tapping off
   if (everyone && mine && !(menus && *menus == '0') && polls % 40 < 3)
     W16(base, state + 4, R16(base, state + 4) | 0x1000);  // XINPUT_GAMEPAD_A
+  // GH_SKIP_TALK=1 (tests): while an event/dialogue runs (work+0x3b4), P1's pad taps BACK (skip
+  // the scene) and A (next line), alternately, whatever the AI setting.
+  static int skip = -1;
+  if (skip < 0) { const char* s = Env("GH_SKIP_TALK"); skip = (s && *s == '1') ? 1 : 0; }
+  if (skip && (int8_t)pad == S8(base, kPadKind) && R8(base, kWork + 0x3b4) && Story(base)) {
+    const uint32_t ph = polls % 60;
+    if (ph < 3) W16(base, state + 4, R16(base, state + 4) | 0x0020);              // BACK
+    else if (ph >= 30 && ph < 33) W16(base, state + 4, R16(base, state + 4) | 0x1000);  // A
+  }
 }
 
 // End of stage / checkpoint: keep P3/P4 level and EXP in their party blocks.
@@ -732,6 +791,7 @@ REX_HOOK_RAW(sub_824E2AC0) {
   const uint32_t stage = ctx.r3.u32;
   __imp__sub_824E2AC0(ctx, base);
   g_stage = stage;
+  std::memset(g_npc_home, 0, sizeof(g_npc_home));
   if (!Enabled() || !HeroSlots()) return;
   int owner[6] = {0, 0, 0, 0, 0, 0};  // hero kind -> slot of the player that plays it (0 = NPC)
   bool used[32] = {};
@@ -755,6 +815,7 @@ REX_HOOK_RAW(sub_824E2AC0) {
     }
     W32(base, at, slot);
     if (slot != old) REXKRNL_INFO("story4p: hero {} slot {} -> {}", k, old, slot);
+    if (!owner[k] && slot != old && slot < 24 && old >= 1 && old < 24) g_npc_home[slot] = (uint8_t)old;
   }
 }
 
@@ -997,6 +1058,248 @@ REX_HOOK_RAW(sub_824C0470) { Expose e(base, 3, 4); __imp__sub_824C0470(ctx, base
 // Asset preload loops only look at entries 0..11; 10/11 are never hero kinds.
 REX_HOOK_RAW(sub_8243E510) { Expose e(base, 10, 11); __imp__sub_8243E510(ctx, base); }
 REX_HOOK_RAW(sub_824EB8D0) { Expose e(base, 10, 11); __imp__sub_824EB8D0(ctx, base); }
+
+// ---------------------------------------------------------------------------------------------
+// Stage actor scripts: P3/P4 run as P2
+// ---------------------------------------------------------------------------------------------
+// The stages drive each hero in cut scenes with an actor script f(stage, slot, kind), whose state
+// lives in stage+0x170dc+slot*4 (step) and stage+0x1713c+slot*4 (scratch), 24 entries each. Some
+// steps only let a party member go on when slot == 1 or slot == 2 (stage 2, sub_82570F70 step 5:
+// P1 after a delay, P2 at once; any other party slot waits for ever, which froze the opening of
+// stage 2 with P3/P4 in slots 3/4). For a P3/P4 slot, the script runs as slot 2: registry entry,
+// kind and both state entries of slots 2 and 3/4 are swapped for the call, as the pause does for
+// the status windows. GH_4P_ASP2=0 turns this off.
+namespace {
+
+bool ScriptsAsP2() {
+  static int v = -1;
+  if (v < 0) { const char* s = std::getenv("GH_4P_ASP2"); v = (s && *s == '0') ? 0 : 1; }
+  return v == 1;
+}
+
+void SwapSlots(uint8_t* base, uint32_t stage, uint32_t a, uint32_t b) {
+  auto swap = [&](uint32_t x, uint32_t y, uint32_t n) {
+    uint8_t t[8];
+    std::memcpy(t, base + x, n);
+    std::memcpy(base + x, base + y, n);
+    std::memcpy(base + y, t, n);
+  };
+  swap(kWork + (a + 0xd1) * 8, kWork + (b + 0xd1) * 8, 8);  // registry
+  swap(kKinds + a, kKinds + b, 1);                          // party kind
+  swap(stage + 0x170dc + a * 4, stage + 0x170dc + b * 4, 4);  // script step
+  swap(stage + 0x1713c + a * 4, stage + 0x1713c + b * 4, 4);  // script scratch
+}
+
+void RunAsP2(PPCContext& ctx, uint8_t* base, PPCFunc* original) {
+  const uint32_t stage = ctx.r3.u32, slot = ctx.r4.u32;
+  const int p = slot == SlotFor(2) ? 2 : (slot == SlotFor(3) ? 3 : -1);
+  // During the opening event of a stage the players have +0xdc = 0; +0xe0 keeps the player index.
+  uint32_t ch = 0;
+  if (!Enabled() || !ScriptsAsP2() || !Story(base) || p < 0 || slot < 3 || slot >= 24 ||
+      S8(base, kKinds + slot) < 0 || !(ch = Chara(base, slot)) || S8(base, ch + 0xE0) != p) {
+    original(ctx, base);
+    return;
+  }
+  static uint32_t logged;  // first time per slot and stage (bit = slot)
+  static uint8_t logged_stage = 0xff;
+  if (logged_stage != R8(base, kWork + 0x3af)) { logged_stage = R8(base, kWork + 0x3af); logged = 0; }
+  if (!(logged & (1u << slot))) {
+    logged |= 1u << slot;
+    REXKRNL_INFO("story4p: stage {} script for slot {} (kind {}) runs as slot 2", (int)logged_stage, slot,
+                 ctx.r5.u32);
+  }
+  SwapSlots(base, stage, 2, slot);
+  ctx.r4.u64 = 2;
+  original(ctx, base);
+  SwapSlots(base, stage, 2, slot);
+}
+
+}  // namespace
+
+static void RunAsP2Hook(PPCContext& ctx, uint8_t* base) { RunAsP2(ctx, base, __imp__sub_82570F70); }
+
+// Every stage actor script f(stage, slot, kind) goes through ActorScript.
+//
+// NPC heroes moved to another slot (Serena 3 -> 5 when P3 takes slot 3) run their script as their
+// original slot: the scripts pick positions from per-slot tables, and a slot the table does not
+// list reads an uninitialised stack value (stage 21, sub_8259B9B8 step 4 "walk to (x, z)": slot 5
+// walked to a random spot and the opening froze when it was unreachable). Same swap as RunAsP2.
+// GH_4P_NPCHOME=0 turns this off.
+//
+// GH_4P_ACTLOG=1 (debugging): log every step change per slot (with the script's address), and while
+// a slot keeps the same step a dump of its character's state fields every 4 s.
+namespace {
+void ActorScript(uint32_t fn, PPCContext& ctx, uint8_t* base, PPCFunc* original) {
+  static int on = -1, home_on = -1;
+  if (on < 0) { const char* s = std::getenv("GH_4P_ACTLOG"); on = (s && *s == '1') ? 1 : 0; }
+  if (home_on < 0) { const char* s = std::getenv("GH_4P_NPCHOME"); home_on = (s && *s == '0') ? 0 : 1; }
+  const uint32_t stage = ctx.r3.u32, slot = ctx.r4.u32, kind = ctx.r5.u32;
+  if (slot >= 24) { original(ctx, base); return; }
+  uint32_t home = 0, hc = 0;
+  if (home_on && Enabled() && g_npc_home[slot] && S8(base, kKinds + slot) < 0 && (hc = Chara(base, slot)) &&
+      R8(base, hc + 0x54) == kind)
+    home = g_npc_home[slot];
+  const uint32_t at = stage + 0x170dc + slot * 4;
+  const int32_t before = (int32_t)R32(base, at);
+  if (home) {
+    static uint64_t logged;  // bit = slot, once per stage object
+    static uint32_t logged_stage;
+    if (logged_stage != stage) { logged_stage = stage; logged = 0; }
+    if (!(logged & (1ull << slot))) {
+      logged |= 1ull << slot;
+      REXKRNL_INFO("story4p: script {:08X}: NPC hero kind {} in slot {} runs as slot {}", fn, kind, slot, home);
+    }
+    SwapSlots(base, stage, home, slot);
+    ctx.r4.u64 = home;
+    original(ctx, base);
+    SwapSlots(base, stage, home, slot);
+  } else {
+    original(ctx, base);
+  }
+  if (!on) return;
+  const int32_t after = (int32_t)R32(base, at);
+  const uint32_t ch = Chara(base, slot);
+  static uint32_t since[24];
+  if (before != after) {
+    REXKRNL_INFO("story4p: act {:08X} f{} slot {} kind {} step {} -> {} chara {:08X}", fn, g_frame, slot, kind,
+                 before, after, ch);
+    since[slot] = g_frame;
+  }
+  const uint32_t held = g_frame - since[slot];
+  if (ch && held >= 240 && held % 240 == 0) {
+    std::string b;
+    for (uint32_t o : {0x28u, 0x2Cu, 0x30u, 0x34u, 0xD8u, 0xDCu, 0xE0u})
+      b += fmt::format(" +{:x}={:08X}", o, R32(base, ch + o));
+    REXKRNL_INFO("story4p: act {:08X} f{} slot {} step {} held {} frames:{} brain {:08X} x {} y {} z {}", fn,
+                 g_frame, slot, after, held, b, R32(base, ch + 0x174), (int32_t)R32(base, ch + 0xC) >> 16,
+                 (int32_t)R32(base, ch + 0x10) >> 16, (int32_t)R32(base, ch + 0x14) >> 16);
+  }
+}
+}  // namespace
+REX_HOOK_RAW(sub_8256EB60) { ActorScript(0x8256EB60, ctx, base, __imp__sub_8256EB60); }
+REX_HOOK_RAW(sub_82572588) { ActorScript(0x82572588, ctx, base, __imp__sub_82572588); }
+REX_HOOK_RAW(sub_82576980) { ActorScript(0x82576980, ctx, base, __imp__sub_82576980); }
+REX_HOOK_RAW(sub_8257BEE0) { ActorScript(0x8257BEE0, ctx, base, __imp__sub_8257BEE0); }
+REX_HOOK_RAW(sub_825806D8) { ActorScript(0x825806D8, ctx, base, __imp__sub_825806D8); }
+REX_HOOK_RAW(sub_82581C00) { ActorScript(0x82581C00, ctx, base, __imp__sub_82581C00); }
+REX_HOOK_RAW(sub_825841A0) { ActorScript(0x825841A0, ctx, base, __imp__sub_825841A0); }
+REX_HOOK_RAW(sub_82585348) { ActorScript(0x82585348, ctx, base, __imp__sub_82585348); }
+REX_HOOK_RAW(sub_82587080) { ActorScript(0x82587080, ctx, base, __imp__sub_82587080); }
+REX_HOOK_RAW(sub_8258A3A0) { ActorScript(0x8258A3A0, ctx, base, __imp__sub_8258A3A0); }
+REX_HOOK_RAW(sub_8258CD30) { ActorScript(0x8258CD30, ctx, base, __imp__sub_8258CD30); }
+REX_HOOK_RAW(sub_8258F720) { ActorScript(0x8258F720, ctx, base, __imp__sub_8258F720); }
+REX_HOOK_RAW(sub_82590FF8) { ActorScript(0x82590FF8, ctx, base, __imp__sub_82590FF8); }
+REX_HOOK_RAW(sub_82593278) { ActorScript(0x82593278, ctx, base, __imp__sub_82593278); }
+REX_HOOK_RAW(sub_82596758) { ActorScript(0x82596758, ctx, base, __imp__sub_82596758); }
+REX_HOOK_RAW(sub_82598658) { ActorScript(0x82598658, ctx, base, __imp__sub_82598658); }
+REX_HOOK_RAW(sub_8259B9B8) { ActorScript(0x8259B9B8, ctx, base, __imp__sub_8259B9B8); }
+REX_HOOK_RAW(sub_825A3318) { ActorScript(0x825A3318, ctx, base, __imp__sub_825A3318); }
+REX_HOOK_RAW(sub_825A6200) { ActorScript(0x825A6200, ctx, base, __imp__sub_825A6200); }
+REX_HOOK_RAW(sub_825AA170) { ActorScript(0x825AA170, ctx, base, __imp__sub_825AA170); }
+REX_HOOK_RAW(sub_825ACBF8) { ActorScript(0x825ACBF8, ctx, base, __imp__sub_825ACBF8); }
+REX_HOOK_RAW(sub_825AEFE0) { ActorScript(0x825AEFE0, ctx, base, __imp__sub_825AEFE0); }
+REX_HOOK_RAW(sub_825B0348) { ActorScript(0x825B0348, ctx, base, __imp__sub_825B0348); }
+REX_HOOK_RAW(sub_825B2E88) { ActorScript(0x825B2E88, ctx, base, __imp__sub_825B2E88); }
+REX_HOOK_RAW(sub_825B3748) { ActorScript(0x825B3748, ctx, base, __imp__sub_825B3748); }
+REX_HOOK_RAW(sub_825B5098) { ActorScript(0x825B5098, ctx, base, __imp__sub_825B5098); }
+REX_HOOK_RAW(sub_825B6AF8) { ActorScript(0x825B6AF8, ctx, base, __imp__sub_825B6AF8); }
+REX_HOOK_RAW(sub_825B82B8) { ActorScript(0x825B82B8, ctx, base, __imp__sub_825B82B8); }
+REX_HOOK_RAW(sub_825B9860) { ActorScript(0x825B9860, ctx, base, __imp__sub_825B9860); }
+REX_HOOK_RAW(sub_825BB090) { ActorScript(0x825BB090, ctx, base, __imp__sub_825BB090); }
+REX_HOOK_RAW(sub_825BD690) { ActorScript(0x825BD690, ctx, base, __imp__sub_825BD690); }
+REX_HOOK_RAW(sub_825BE8E0) { ActorScript(0x825BE8E0, ctx, base, __imp__sub_825BE8E0); }
+REX_HOOK_RAW(sub_825C0E98) { ActorScript(0x825C0E98, ctx, base, __imp__sub_825C0E98); }
+REX_HOOK_RAW(sub_825C3948) { ActorScript(0x825C3948, ctx, base, __imp__sub_825C3948); }
+REX_HOOK_RAW(sub_825C4C30) { ActorScript(0x825C4C30, ctx, base, __imp__sub_825C4C30); }
+REX_HOOK_RAW(sub_825C6650) { ActorScript(0x825C6650, ctx, base, __imp__sub_825C6650); }
+REX_HOOK_RAW(sub_825C74C0) { ActorScript(0x825C74C0, ctx, base, __imp__sub_825C74C0); }
+REX_HOOK_RAW(sub_825C99E8) { ActorScript(0x825C99E8, ctx, base, __imp__sub_825C99E8); }
+REX_HOOK_RAW(sub_825CB1F0) { ActorScript(0x825CB1F0, ctx, base, __imp__sub_825CB1F0); }
+REX_HOOK_RAW(sub_825CD678) { ActorScript(0x825CD678, ctx, base, __imp__sub_825CD678); }
+REX_HOOK_RAW(sub_82570F70) { ActorScript(0x82570F70, ctx, base, RunAsP2Hook); }
+
+// ---------------------------------------------------------------------------------------------
+// Quick start (tests): GH_QUICK=<stage> skips the menus and starts the story at that stage
+// ---------------------------------------------------------------------------------------------
+// Top-level modes (sub_8248A1F0): u16 0x829b2184 current, 0x829b2186 next, 0x829b2188 previous,
+// u8 0x829b218a "just entered". Mode 4 = New Game screen, 8 = story stage. When the New Game screen
+// ends it resets the work (sub_8249A868), sets work+0x3c4 bit 1 (Han -> kind 7), puts each chosen
+// hero in the party (sub_824968F0: kind + level 1 block), then sub_82497898 / sub_82499F40(owner,0)
+// and mode 8, which loads the stage in work+0x3af. The quick start does the same the first time the
+// mode GH_QUICK_MODE (default 3, the main menu) is entered.
+//   GH_QUICK=N        stage index as in the logs (0 = first stage, 1 = stage 2, ...)
+//   GH_QUICK_PARTY    hero kind per player, default "2354" (Han, Randy, Nicole, Ginjirou);
+//                     1 Serena, 2 Han, 3 Randy, 4 Ginjirou, 5 Nicole. Its length = number of players.
+//   GH_QUICK_PADS     pad per player, default "0123".
+// Works without GH_4P for 1-2 players; P3/P4 need GH_4P=1.
+namespace {
+
+constexpr uint32_t kModeCur = 0x829b2184, kModeNext = 0x829b2186;
+constexpr uint32_t kOwner = 0x829caaf0;
+
+void QuickStart(Guest& g, int stage) {
+  uint8_t* base = g.base;
+  const char* party = Env("GH_QUICK_PARTY");
+  const char* pads = Env("GH_QUICK_PADS");
+  if (!party) party = "2354";
+  if (!pads) pads = "0123";
+  const int n = (int)std::min<size_t>(std::strlen(party), Enabled() ? 4 : 2);
+
+  g(sub_8249A868, kWork);
+  W32(base, kWork + 0x3c4, (R32(base, kWork + 0x3c4) | 2) & ~4u);
+  for (int p = 0; p < 4; p++) W8(base, kPadKind + p, 0xFF);
+  for (int p = 0; p < n; p++) {
+    const int kind = party[p] - '0';
+    const int pad = (p < (int)std::strlen(pads)) ? pads[p] - '0' : p;
+    if (kind < 1 || kind > 5) continue;
+    if (p < 2) {
+      g(sub_824968F0, kWork, (uint64_t)(p + 1), (uint64_t)kind);
+    } else {
+      const uint32_t slot = SlotFor(p);
+      const uint32_t at = slot < 12 ? slot : (p == 2 ? 10u : 11u);
+      g(sub_824968F0, kWork, at, (uint64_t)kind);
+      if (at != slot) { W8(base, kKinds + slot, (uint8_t)kind); W8(base, kKinds + at, 0xFF); }
+    }
+    g(sub_82496728, kGlobalWork, (uint64_t)p, (uint64_t)pad);
+  }
+  W8(base, kWork + 0x3ae, 9);  // credits
+  W8(base, kWork + 0x3af, (uint8_t)stage);
+  g(sub_82497898, kOwner);
+  g(sub_82499F40, kOwner, 0);
+  for (uint32_t i = 0; i < 3; i++) {  // as the New Game exit: clear +6/+0xa of blocks 0..2
+    W16(base, kWork + i * kBlock + 6, 0);
+    W16(base, kWork + i * kBlock + 10, 0);
+  }
+  W16(base, kModeNext, 8);
+  REXKRNL_INFO("story4p: quick start: stage {} party {} pads {}", stage, party, pads);
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_8248A1F0) {
+  const PPCContext saved = ctx;
+  __imp__sub_8248A1F0(ctx, base);
+  static int quick = -2, trigger = 3;
+  static bool done = false;
+  static uint16_t last = 0xffff;
+  if (quick == -2) {
+    const char* q = Env("GH_QUICK");
+    const char* m = Env("GH_QUICK_MODE");
+    quick = q ? std::atoi(q) : -1;
+    if (m) trigger = std::atoi(m);
+  }
+  if (quick < 0) return;
+  const uint16_t cur = R16(base, kModeCur);
+  if (cur != last) {
+    REXKRNL_INFO("story4p: mode {} -> {}", last == 0xffff ? -1 : (int)last, (int)cur);
+    last = cur;
+    if (cur == trigger && !done) {
+      done = true;
+      Guest g(const_cast<PPCContext&>(saved), base);
+      QuickStart(g, quick);
+    }
+  }
+}
 
 // Debug (GH_4P_LOGCREATE=1): every character creation (slot, kind, level, brain code).
 REX_HOOK_RAW(sub_8247A530) {
