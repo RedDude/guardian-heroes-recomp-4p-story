@@ -21,7 +21,9 @@
 //   * The camera (sub_82498808) frames every focus point that players register each frame
 //     (sub_8246B2D8 -> sub_82496BB0), so P3/P4 are framed once they are flagged as on screen.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -45,6 +47,7 @@ extern "C" REX_FUNC(__imp__sub_82499F40);   // save party progress / checkpoint
 extern "C" REX_FUNC(__imp__sub_82498808);   // camera update (once per frame in a stage)
 extern "C" REX_FUNC(__imp__sub_82500658);   // parameter screen: next/previous hero index
 extern "C" REX_FUNC(__imp__sub_824892C0);   // modes 5/6: parameter screen
+extern "C" REX_FUNC(__imp__sub_82489160);   // mode 4: New Game screen
 extern "C" REX_FUNC(__imp__sub_825022D8);   // parameter screen constructor (this, join mode)
 extern "C" REX_FUNC(__imp__sub_824E4308);   // continue: downed P1/P2 spend a credit
 extern "C" REX_FUNC(__imp__sub_825CF040);   // XamInputGetState(pad, 1, state)
@@ -1764,7 +1767,118 @@ void SeatsOut(uint8_t* base) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// New Game screen: P3/P4 wait, then choose their hero
+// ---------------------------------------------------------------------------------------------
+// Mode 4 (sub_82489160) runs the New Game screen (sub_824F4678, new_game.mrg): two hero panels; a
+// pad that is not P1's pressing START there becomes P2 (screen state 2, sub_824F33C0). While it
+// runs, any other free pad pressing a button (directions do not count) is put in a queue and an
+// overlay shows "Player N is waiting". When the screen ends towards the first stage (next mode 8),
+// each queued pad goes through the game's own "P2 joins" screen (mode 6: hero choice + points),
+// with P2 parked as for a join in a stage (Park/Unpark); with no P2 yet, the first one simply
+// becomes P2. GH_4P_WAIT=0 turns this off.
+bool WaitEnabled() {
+  static int v = -1;
+  if (v < 0) { const char* s = Env("GH_4P_WAIT"); v = (s && *s == '0') ? 0 : 1; }
+  return v == 1 && Enabled() && MaxPlayers() > 2;
+}
+
+int g_wait[3];               // queued pads, in the order they pressed
+int g_nwait;
+bool g_wait_chain;           // a mode 6 screen started from the queue is running
+std::atomic<int> g_wait_label[3];  // player number shown by the overlay (0 = nothing)
+
+void WaitPublish(int first_player) {
+  for (int i = 0; i < 3; i++) g_wait_label[i] = i < g_nwait ? first_player + i : 0;
+}
+
+void WaitClear() {
+  g_nwait = 0;
+  g_wait_chain = false;
+  WaitPublish(0);
+}
+
+// Seats taken on the New Game screen: P1, plus P2 once a pad joined there.
+int SeatedOnNewGame(uint8_t* base) { return S8(base, kPadKind + 1) >= 0 ? 2 : 1; }
+
+void WaitScan(Guest& g) {
+  uint8_t* base = g.base;
+  for (int pad = 0; pad < 4; pad++) {
+    if (SeatedOnNewGame(base) + g_nwait >= MaxPlayers()) break;
+    bool taken = S8(base, kPadKind + 0) == pad || S8(base, kPadKind + 1) == pad;
+    for (int i = 0; i < g_nwait; i++) taken |= g_wait[i] == pad;
+    if (taken || !(g(sub_82419C38, pad) & 1)) continue;
+    // Bits 0x01..0x80 are the directions (stick included), 0x1000 A, 0x2000 B, 0x400000 START...
+    if (!(R32(base, g(sub_8241B800, pad)) & 0xFFFFFF00u)) continue;
+    g_wait[g_nwait++] = pad;
+    REXKRNL_INFO("story4p: pad {} waiting on the New Game screen", pad);
+  }
+}
+
+// A queued pad that became P2 on the screen (it pressed START) leaves the queue.
+void WaitDedupe(uint8_t* base) {
+  int n = 0;
+  for (int i = 0; i < g_nwait; i++)
+    if (g_wait[i] != S8(base, kPadKind + 1)) g_wait[n++] = g_wait[i];
+  g_nwait = n;
+}
+
+// Starts the join screen (next mode 6) for the first queued pad; false when nobody is left.
+bool WaitNextJoin(Guest& g) {
+  uint8_t* base = g.base;
+  while (g_nwait > 0) {
+    const int pad = g_wait[0];
+    for (int i = 1; i < g_nwait; i++) g_wait[i - 1] = g_wait[i];
+    g_nwait--;
+    int seat = -1;  // 1 = P2, 2/3 = P3/P4
+    if (S8(base, kPadKind + 1) < 0 && S8(base, kKinds + 2) < 0) {
+      seat = 1;
+    } else {
+      for (int p = 2; p < MaxPlayers(); p++)
+        if (S8(base, KindOf(p)) < 0) { seat = p; break; }
+    }
+    if (seat < 0) break;
+    if (seat >= 2) Park(base, seat, pad);
+    g(sub_82496728, kGlobalWork, 1, (uint64_t)pad);
+    W8(base, kGlobalWork + 0x2c, 0);
+    W16(base, kModeNext, 6);
+    WaitPublish(seat + 2);
+    REXKRNL_INFO("story4p: pad {} chooses a hero as P{}", pad, seat + 1);
+    return true;
+  }
+  WaitClear();
+  return false;
+}
+
 }  // namespace
+
+// Mode 4: New Game screen (created on the first frame; the next mode is set when it ends).
+REX_HOOK_RAW(sub_82489160) {
+  if (!WaitEnabled()) { __imp__sub_82489160(ctx, base); return; }
+  const bool entered = R8(base, kModeEntered) != 0;
+  if (entered) WaitClear();
+  const PPCContext saved = ctx;
+  if (!entered) {
+    Guest g(ctx, base);
+    WaitScan(g);
+  }
+  const uint16_t next = R16(base, kModeNext);
+  W16(base, kModeNext, 0xFFFF);  // sentinel: the original writes the next mode when the screen ends
+  __imp__sub_82489160(ctx, base);
+  const uint16_t now = R16(base, kModeNext);
+  WaitDedupe(base);
+  if (now == 0xFFFF) {
+    W16(base, kModeNext, next);
+    WaitPublish(SeatedOnNewGame(base) + 1);
+    return;
+  }
+  if (now == 8 && g_nwait > 0) {
+    Guest g(const_cast<PPCContext&>(saved), base);
+    g_wait_chain = WaitNextJoin(g);
+  } else {
+    WaitClear();
+  }
+}
 
 REX_HOOK_RAW(sub_8248A1F0) {
   const PPCContext saved = ctx;
@@ -1793,6 +1907,24 @@ REX_HOOK_RAW(sub_8248A1F0) {
 
 // Modes 5/6: parameter screen (created on the first frame; the next mode is set when it ends).
 REX_HOOK_RAW(sub_824892C0) {
+  if (Enabled() && g_wait_chain) {  // join screen started from the New Game queue
+    const PPCContext saved = ctx;
+    const uint16_t next = R16(base, kModeNext);
+    W16(base, kModeNext, 0xFFFF);
+    __imp__sub_824892C0(ctx, base);
+    const uint16_t now = R16(base, kModeNext);
+    if (now == 0xFFFF) { W16(base, kModeNext, next); return; }
+    if (now == 6) return;  // the game shows the join screen again
+    Unpark(base);
+    g_wait_chain = false;
+    if (now == 8 && g_nwait > 0) {
+      Guest g(const_cast<PPCContext&>(saved), base);
+      g_wait_chain = WaitNextJoin(g);
+    } else {
+      WaitClear();
+    }
+    return;
+  }
   if (!Enabled() || !PointsPass() || !Story(base)) { __imp__sub_824892C0(ctx, base); return; }
   const uint16_t mode = R16(base, kModeCur);
   if (R8(base, kModeEntered) && mode == 5) {
@@ -1862,3 +1994,48 @@ REX_HOOK_RAW(sub_82418928) {
     REXKRNL_WARN("story4p: file buffer alloc failed: {:#x} bytes (type {}), {} failures", size, type, fails);
 }
 
+
+#if !defined(__SWITCH__)
+#include <imgui.h>
+#include <rex/ui/imgui_dialog.h>
+
+// "Player N is waiting" over the New Game screen and the join screens that follow it.
+namespace {
+class WaitOverlay : public rex::ui::ImGuiDialog {
+ public:
+  explicit WaitOverlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    char text[96];
+    int len = 0;
+    for (int i = 0; i < 3; i++) {
+      const int n = g_wait_label[i];
+      if (n <= 0) continue;
+      len += std::snprintf(text + len, sizeof(text) - len, "%sPlayer %d is waiting", len ? "\n" : "", n);
+    }
+    if (!len) return;
+    const float scale = std::max(1.5f, io.DisplaySize.y / 280.0f);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.93f), ImGuiCond_Always,
+                            ImVec2(0.5f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoFocusOnAppearing;
+    if (ImGui::Begin("##gh4p_wait", nullptr, flags)) {
+      ImGui::SetWindowFontScale(scale);
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+      ImGui::TextUnformatted(text);
+      ImGui::PopStyleColor();
+    }
+    ImGui::End();
+  }
+};
+}  // namespace
+
+// Called by GhApp::OnCreateDialogs; the dialog is deleted with the drawer.
+void Story4pCreateOverlay(rex::ui::ImGuiDrawer* drawer) {
+  if (Enabled()) new WaitOverlay(drawer);
+}
+#endif
