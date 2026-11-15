@@ -41,6 +41,8 @@ extern "C" REX_FUNC(__imp__sub_824E3618);   // in-stage "P2 joins" check
 extern "C" REX_FUNC(__imp__sub_82499F40);   // save party progress / checkpoint
 extern "C" REX_FUNC(__imp__sub_82498808);   // camera update (once per frame in a stage)
 extern "C" REX_FUNC(__imp__sub_82500658);   // parameter screen: next/previous hero index
+extern "C" REX_FUNC(__imp__sub_824892C0);   // modes 5/6: parameter screen
+extern "C" REX_FUNC(__imp__sub_825022D8);   // parameter screen constructor (this, join mode)
 extern "C" REX_FUNC(__imp__sub_824E4308);   // continue: downed P1/P2 spend a credit
 extern "C" REX_FUNC(__imp__sub_825CF040);   // XamInputGetState(pad, 1, state)
 extern "C" REX_FUNC(sub_8243FCE0);  // init create-params struct
@@ -1274,6 +1276,89 @@ void QuickStart(Guest& g, int stage) {
   REXKRNL_INFO("story4p: quick start: stage {} party {} pads {}", stage, party, pads);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Parameter screen after a stage: a second pass for P3/P4
+// ---------------------------------------------------------------------------------------------
+// Mode 5 (sub_824892C0, modes 5/6) runs the parameter screen (sub_825022D8, param_edit.mrg) after
+// each stage, after a continue and after loading a save. Its two panels serve seat i = 0/1, i.e.
+// party i+1: kind work+0x3d9+i, block work+(i+1)*0x24, pad pad_kind[i]. Free points are
+// level - points spent (block +0x15..+0x1a, sub_82500018), so P3/P4 only need their level in their
+// block (kept by the sub_82499F40 hook). When the P1/P2 screen ends towards the stage (next mode 8),
+// mode 5 is entered again (as the game itself does for result 3) with P3/P4 swapped into the seats;
+// a missing P3 or P4 leaves its seat empty. The swap is undone when that screen ends.
+// GH_4P_POINTS=0 turns this off.
+constexpr uint32_t kModeEntered = 0x829b218a;
+
+bool PointsPass() {
+  static int v = -1;
+  if (v < 0) { const char* s = Env("GH_4P_POINTS"); v = (s && *s == '0') ? 0 : 1; }
+  return v == 1;
+}
+
+int g_points_pass;  // 0 = off, 1 = P1/P2 screen with P3/P4 waiting, 2 = P3/P4 screen
+struct Seats {
+  int player[2] = {-1, -1};  // player sitting in seat 0/1 during pass 2 (-1 = seat left empty)
+  int8_t kind[2] = {}, pad[2] = {};
+  uint8_t block[2][kBlock] = {};
+} g_seats;
+
+bool HasExtras(uint8_t* base) {
+  for (int p = 2; p < MaxPlayers(); p++)
+    if (S8(base, KindOf(p)) >= 0) return true;
+  return false;
+}
+
+// Free points of a block (as sub_82500018 counts them).
+int FreePoints(uint8_t* base, uint32_t blk) {
+  int n = R8(base, blk + 0xe);
+  for (uint32_t a = 0x15; a <= 0x1a; a++) n -= R8(base, blk + a);
+  return n;
+}
+
+void LogExtras(uint8_t* base, const char* when) {
+  for (int p = 2; p < 4; p++) {
+    if (S8(base, KindOf(p)) < 0) continue;
+    const uint32_t b = BlockOf(p);
+    REXKRNL_INFO("story4p: points {} P{} kind {} level {} spent {} {} {} {} {} {} free {}", when, p + 1,
+                 S8(base, KindOf(p)), R8(base, b + 0xe), R8(base, b + 0x15), R8(base, b + 0x16),
+                 R8(base, b + 0x17), R8(base, b + 0x18), R8(base, b + 0x19), R8(base, b + 0x1a),
+                 FreePoints(base, b));
+  }
+}
+
+void SeatsIn(uint8_t* base) {
+  int n = 0;
+  g_seats.player[0] = g_seats.player[1] = -1;
+  for (int p = 2; p < MaxPlayers(); p++)
+    if (S8(base, KindOf(p)) >= 0) g_seats.player[n++] = p;
+  for (int i = 0; i < 2; i++) {
+    const uint32_t kind = kKinds + 1 + i, blk = kWork + (1 + i) * kBlock, pad = kPadKind + i;
+    g_seats.kind[i] = S8(base, kind);
+    g_seats.pad[i] = S8(base, pad);
+    std::memcpy(g_seats.block[i], base + blk, kBlock);
+    const int p = g_seats.player[i];
+    if (p >= 0) {
+      W8(base, kind, R8(base, KindOf(p)));
+      W8(base, pad, R8(base, kPadKind + p));
+      std::memcpy(base + blk, base + BlockOf(p), kBlock);
+    } else {
+      W8(base, kind, 0xFF);  // no panel for this seat
+      W8(base, pad, 0xFF);
+    }
+  }
+}
+
+void SeatsOut(uint8_t* base) {
+  for (int i = 0; i < 2; i++) {
+    const uint32_t kind = kKinds + 1 + i, blk = kWork + (1 + i) * kBlock, pad = kPadKind + i;
+    const int p = g_seats.player[i];
+    if (p >= 0) std::memcpy(base + BlockOf(p), base + blk, kBlock);
+    W8(base, kind, (uint8_t)g_seats.kind[i]);
+    W8(base, pad, (uint8_t)g_seats.pad[i]);
+    std::memcpy(base + blk, g_seats.block[i], kBlock);
+  }
+}
+
 }  // namespace
 
 REX_HOOK_RAW(sub_8248A1F0) {
@@ -1299,6 +1384,46 @@ REX_HOOK_RAW(sub_8248A1F0) {
       QuickStart(g, quick);
     }
   }
+}
+
+// Modes 5/6: parameter screen (created on the first frame; the next mode is set when it ends).
+REX_HOOK_RAW(sub_824892C0) {
+  if (!Enabled() || !PointsPass() || !Story(base)) { __imp__sub_824892C0(ctx, base); return; }
+  const uint16_t mode = R16(base, kModeCur);
+  if (R8(base, kModeEntered) && mode == 5) {
+    if (g_points_pass == 2) {
+      LogExtras(base, "before");
+      SeatsIn(base);
+      REXKRNL_INFO("story4p: parameter screen for P3/P4 (seats: P{} P{})", g_seats.player[0] + 1,
+                   g_seats.player[1] + 1);
+    } else {
+      g_points_pass = HasExtras(base) ? 1 : 0;
+    }
+  }
+  const uint16_t next = R16(base, kModeNext);
+  W16(base, kModeNext, 0xFFFF);  // sentinel: the original writes the next mode when the screen ends
+  __imp__sub_824892C0(ctx, base);
+  const uint16_t now = R16(base, kModeNext);
+  if (now == 0xFFFF) { W16(base, kModeNext, next); return; }
+  if (g_points_pass == 2) {
+    SeatsOut(base);
+    g_points_pass = 0;
+    LogExtras(base, "after");
+  } else if (g_points_pass == 1 && mode == 5 && now == 8) {
+    W16(base, kModeNext, 5);  // once more, for P3/P4
+    g_points_pass = 2;
+  } else {
+    g_points_pass = 0;
+  }
+}
+
+// Parameter screen constructor (this, join mode). Outside the join flow, a pad that is not P1's
+// pressing START on the screen joins as P2 (screen +0x2c, sub_82500528); with P3/P4 in the game that
+// pad may be theirs, and in the P3/P4 pass the seats hold other players. Players join in the stage.
+REX_HOOK_RAW(sub_825022D8) {
+  const bool join = ctx.r4.u32 & 0xff;
+  __imp__sub_825022D8(ctx, base);
+  if (Enabled() && !join && g_points_pass && ctx.r3.u32) W8(base, ctx.r3.u32 + 0x2c, 0);
 }
 
 // Debug (GH_4P_LOGCREATE=1): every character creation (slot, kind, level, brain code).
