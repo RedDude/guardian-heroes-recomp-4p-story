@@ -47,6 +47,11 @@ extern "C" REX_FUNC(__imp__sub_82499F40);   // save party progress / checkpoint
 extern "C" REX_FUNC(__imp__sub_82498808);   // camera update (once per frame in a stage)
 extern "C" REX_FUNC(__imp__sub_82500658);   // parameter screen: next/previous hero index
 extern "C" REX_FUNC(__imp__sub_824892C0);   // modes 5/6: parameter screen
+extern "C" REX_FUNC(__imp__sub_824D0EF8);   // route choice menu constructor
+extern "C" REX_FUNC(__imp__sub_824D3EC8);   // stage prop placed (r4 = object, +0x188 layout)
+extern "C" REX_FUNC(__imp__sub_824D3AF8);   // stage prop placed (r4 = object, +0x17c layout)
+extern "C" REX_FUNC(__imp__sub_82443550);   // prop destructor (vtables 0x8200E0B0..0x8200E530)
+extern "C" REX_FUNC(__imp__sub_82443FF8);   // prop destructor (vtables 0x8200E570/0x8200E5B0)
 extern "C" REX_FUNC(__imp__sub_82489160);   // mode 4: New Game screen
 extern "C" REX_FUNC(__imp__sub_825022D8);   // parameter screen constructor (this, join mode)
 extern "C" REX_FUNC(__imp__sub_824E4308);   // continue: downed P1/P2 spend a credit
@@ -254,6 +259,10 @@ uint32_t g_stage;  // stage object (seen in sub_824E2AC0)
 // NPC hero moved by sub_824E2AC0's hook: g_npc_home[new slot] = original slot (0 = not moved).
 uint8_t g_npc_home[24];
 int g_kind[4] = {-1, -1, -1, -1};  // kind spawned this stage for P3/P4 (diagnostics, hero slots)
+// Last progress seen on P3/P4's character while it was alive (level/EXP). The end-of-stage save
+// (sub_82499F40) runs during the closing scene, when +0xDC is already 0 or the character is gone,
+// so it uses this copy instead of reading the character then.
+struct Prog { int kind = -1; uint32_t exp = 0; uint16_t d6 = 0; uint8_t lv = 0; } g_prog[4];
 uint32_t g_cont[2][2];  // P3/P4: continue state, timer (see the sub_824E4308 hook)
 void ClearRoster();     // saved heroes of P2/P3/P4 (see "Progress of P2/P3/P4 across saves")
 
@@ -497,6 +506,9 @@ void AutoDebug(uint8_t* base) {
     if (g_kill_req) REXKRNL_INFO("story4p: {} enemies at 1 HP", n);
     g_kill_req = false;
   }
+  static int played_stage = -1;  // the count restarts with each stage (it used to carry over)
+  const int stage_now = R8(base, kWork + 0x3af);
+  if (stage_now != played_stage) { played_stage = stage_now; played = 0; }
   if (!event) played++;
   if (skip > 0 && played >= (uint32_t)skip * 60) {
     played = 0;
@@ -536,7 +548,52 @@ struct Idle {
   uint32_t dir_since = 0;
   int32_t cam = 0;        // camera centre when the walk started / last scrolled
   bool scrolled = false;
+  uint32_t target = 0;    // breakable prop being hit while walking (0 = none)
+  uint32_t target_since = 0;
+  uint32_t jump_until = 0;  // jumping over a prop that did not break (frame)
 } g_idle[4];
+
+// Breakable stage props (barrels, crates, stools...): placed by sub_824D3EC8/sub_824D3AF8, removed by
+// their destructors. Breakable = vtable 0x8200E0F0..0x8200E4F0 or 0x8200E5B0 (the classes that set
+// HP; 0x8200E0B0/0x8200E570 are fixed scenery, 0x8200E530 are pickups), HP at +0xCA.
+constexpr int kMaxProps = 128;
+uint32_t g_props[kMaxProps];
+uint32_t g_props_skip[kMaxProps];  // props given up on (could not be broken)
+
+bool BreakableVt(uint32_t vt) {
+  return (vt >= 0x8200E0F0 && vt <= 0x8200E4F0 && (vt & 0x3F) == 0x30) || vt == 0x8200E5B0;
+}
+
+void AddProp(uint8_t* base, uint32_t obj) {
+  if (!obj || !BreakableVt(R32(base, obj))) return;
+  for (uint32_t& o : g_props) if (o == obj) return;
+  for (int i = 0; i < kMaxProps; i++)
+    if (!g_props[i]) { g_props[i] = obj; g_props_skip[i] = 0; return; }
+}
+
+void RemoveProp(uint32_t obj) {
+  for (int i = 0; i < kMaxProps; i++)
+    if (g_props[i] == obj) { g_props[i] = 0; g_props_skip[i] = 0; }
+}
+
+// A breakable prop with HP left right ahead of x (pixels) in direction dir, in the same depth lane.
+uint32_t PropAhead(uint8_t* base, int32_t x, int32_t z, int dir) {
+  for (int i = 0; i < kMaxProps; i++) {
+    const uint32_t o = g_props[i];
+    if (!o || g_props_skip[i]) continue;
+    if (!BreakableVt(R32(base, o))) { g_props[i] = 0; continue; }  // freed and reused
+    if ((int16_t)R16(base, o + 0xCA) <= 0) continue;
+    const int32_t ox = (int32_t)R32(base, o + 0xC) >> 16, oz = (int32_t)R32(base, o + 0x14) >> 16;
+    const int32_t ahead = (ox - x) * dir;
+    if (ahead >= -8 && ahead <= 72 && oz - z >= -40 && oz - z <= 40) return o;
+  }
+  return 0;
+}
+
+void SkipProp(uint32_t obj) {
+  for (int i = 0; i < kMaxProps; i++)
+    if (g_props[i] == obj) g_props_skip[i] = 1;
+}
 
 int IdleSeconds() {
   static int v = -2;
@@ -568,6 +625,8 @@ bool EnemyInView(uint8_t* base) {
 void StopWalk(int p, const char* why) {
   if (g_idle[p].dir) REXKRNL_INFO("story4p: AI P{} walk stops ({})", p + 1, why);
   g_idle[p].dir = 0;
+  g_idle[p].target = 0;
+  g_idle[p].jump_until = 0;
   g_idle[p].since = g_frame;
   g_retry[p] = 0;
 }
@@ -595,6 +654,33 @@ bool UpdateIdle(uint8_t* base, int p, uint32_t ch) {
     return true;
   }
   if (EnemyInView(base)) { StopWalk(p, "enemy in view"); w.anchor = x; return false; }
+  // A breakable prop in the way: stop and hit it (the pad taps X, see the pad hook) until it breaks;
+  // after 4 s it is left alone. The walk timers wait meanwhile.
+  if (w.target && (!BreakableVt(R32(base, w.target)) || (int16_t)R16(base, w.target + 0xCA) <= 0)) {
+    REXKRNL_INFO("story4p: AI P{} broke the prop", p + 1);
+    w.target = 0;
+  }
+  if (!w.target) {
+    const int32_t z = (int32_t)R32(base, ch + 0x14) >> 16;
+    if (uint32_t o = PropAhead(base, x, z, w.dir)) {
+      w.target = o;
+      w.target_since = g_frame;
+      REXKRNL_INFO("story4p: AI P{} hits a prop at x {} (vt {:08X} hp {})", p + 1,
+                   (int32_t)R32(base, o + 0xC) >> 16, R32(base, o), (int16_t)R16(base, o + 0xCA));
+    }
+  }
+  if (w.target) {
+    if (g_frame - w.target_since > 60) {  // 1 s without breaking it: jump over it and go on
+      REXKRNL_INFO("story4p: AI P{} jumps over the prop", p + 1);
+      SkipProp(w.target);
+      w.target = 0;
+      w.jump_until = g_frame + 45;
+    } else {
+      w.dir_since = g_frame;
+      w.since = g_frame;
+      return true;
+    }
+  }
   if (cam > w.cam + 8 || cam < w.cam - 8) {  // the camera follows: keep going while it scrolls
     w.cam = cam;
     w.dir_since = g_frame;
@@ -742,6 +828,7 @@ REX_HOOK_RAW(sub_8249A868) {
   __imp__sub_8249A868(ctx, base);
   if (!Enabled()) return;
   for (int p = 2; p < 4; p++) W8(base, kPadKind + p, 0xFF);
+  for (Prog& pr : g_prog) pr = Prog{};
   std::memset(g_cont, 0, sizeof(g_cont));
   ClearRoster();  // New Game forgets the saved heroes; a load restores them right after (sub_82497950)
   REXKRNL_INFO("story4p: story work reset, P3/P4 seats cleared");
@@ -881,7 +968,16 @@ REX_HOOK_RAW(sub_825CF040) {
   // AI players walking on (UpdateIdle): hold the d-pad and the stick on their pad.
   for (int p = 0; p < 4; p++) {
     if (!g_idle[p].dir || S8(base, kPadKind + p) != (int8_t)pad) continue;
-    const uint16_t b = R16(base, state + 4) & ~0x000Cu;
+    if (g_idle[p].target) {  // hitting a prop: no direction, tap X (attack)
+      const uint16_t b = R16(base, state + 4) & ~0x000Fu;
+      W16(base, state + 4, (polls % 16) < 4 ? (b | 0x4000) : b);
+      W16(base, state + 8, 0);
+      W16(base, state + 10, 0);
+      continue;
+    }
+    uint16_t b = R16(base, state + 4) & ~0x000Cu;
+    // Jumping over a prop: A for the first frames of the jump (A = jump), direction held throughout.
+    if (g_idle[p].jump_until > g_frame && g_idle[p].jump_until - g_frame > 33) b |= 0x1000;
     W16(base, state + 4, b | (g_idle[p].dir > 0 ? 0x0008 : 0x0004));  // DPAD_RIGHT / DPAD_LEFT
     W16(base, state + 8, g_idle[p].dir > 0 ? 0x7FFF : 0x8001);       // sThumbLX
     W16(base, state + 10, 0);                                         // sThumbLY
@@ -991,15 +1087,20 @@ void TakeSnapshot(uint8_t* base) {
 
 // End of stage / checkpoint: keep P3/P4 level and EXP in their party blocks.
 REX_HOOK_RAW(sub_82499F40) {
+  if (Enabled())
+    REXKRNL_INFO("story4p: party save r4 {} stage {} prog P3 k{} lv{} P4 k{} lv{}", ctx.r4.u32 & 0xff,
+                 (int)R8(base, kWork + 0x3af), g_prog[2].kind, g_prog[2].lv, g_prog[3].kind, g_prog[3].lv);
   if (Enabled() && (ctx.r4.u32 & 0xff)) {
     for (int p = 2; p < 4; p++) {
-      if (S8(base, KindOf(p)) < 0) continue;
-      uint32_t ch = Chara(base, SlotFor(p));
-      if (!ch || R8(base, ch + 0xDC) != 1) continue;
+      const int kind = S8(base, KindOf(p));
+      if (kind < 0 || g_prog[p].kind != kind) continue;
       const uint32_t blk = BlockOf(p);
-      W32(base, blk + 0, R32(base, ch + 0xC0));
-      W16(base, blk + 0xc, R16(base, ch + 0xD6));
-      W8(base, blk + 0xe, R8(base, ch + 0xE1));
+      if (g_prog[p].lv < R8(base, blk + 0xe)) continue;  // never lower a saved level
+      W32(base, blk + 0, g_prog[p].exp);
+      W16(base, blk + 0xc, g_prog[p].d6);
+      W8(base, blk + 0xe, g_prog[p].lv);
+      REXKRNL_INFO("story4p: P{} progress kept: kind {} level {} exp {}", p + 1, kind, g_prog[p].lv,
+                   g_prog[p].exp);
     }
   }
   __imp__sub_82499F40(ctx, base);
@@ -1010,6 +1111,7 @@ REX_HOOK_RAW(sub_82499F40) {
 // Snapshot restored (save loaded, continue after a game over): the saved heroes wait for their players.
 REX_HOOK_RAW(sub_82497950) {
   __imp__sub_82497950(ctx, base);
+  for (Prog& pr : g_prog) pr = Prog{};
   if (!KeepProgress()) return;
   g_roster = g_snap;
   REXKRNL_INFO("story4p: party progress restored:{}", RosterText(g_roster));
@@ -1137,6 +1239,23 @@ REX_HOOK_RAW(sub_82498808) {
     BringExtrasAfterEvent(base);
     // Infinite credits (work+0x3ae): kept at 9; the HUD counter is hidden (sub_8247FE88).
     if (InfiniteCredits() && Story(base) && R8(base, kWork + 0x3ae) < 9) W8(base, kWork + 0x3ae, 9);
+    for (int p = 2; p < 4; p++) {
+      const int kind = S8(base, KindOf(p));
+      const uint32_t ch = kind >= 0 ? Chara(base, SlotFor(p)) : 0;
+      if (ch && R8(base, ch + 0x54) == kind && R8(base, ch + 0xE1) > 0) {
+        g_prog[p] = Prog{kind, R32(base, ch + 0xC0), R16(base, ch + 0xD6), R8(base, ch + 0xE1)};
+        // The level-up (sub_82468E90) writes P1/P2's block at once; P3/P4's block did not follow, so
+        // the next stage created them at the old level. Keep their block up to date here.
+        const uint32_t blk = BlockOf(p);
+        const uint8_t lv = g_prog[p].lv, blv = R8(base, blk + 0xe);
+        if (lv > blv || (lv == blv && g_prog[p].exp > R32(base, blk + 0))) {
+          if (lv > blv) REXKRNL_INFO("story4p: P{} level {} -> block (was {})", p + 1, lv, blv);
+          W32(base, blk + 0, g_prog[p].exp);
+          W16(base, blk + 0xc, g_prog[p].d6);
+          W8(base, blk + 0xe, lv);
+        }
+      }
+    }
     Guest g(ctx, base);
     UpdateAi(g);
     AutoDebug(base);
@@ -1892,6 +2011,18 @@ REX_HOOK_RAW(sub_8248A1F0) {
     quick = q ? std::atoi(q) : -1;
     if (m) trigger = std::atoi(m);
   }
+  // Route log (always): story stage changes, and the mode when it changes.
+  {
+    static int last_stage = -1;
+    static uint16_t last_mode = 0xffff;
+    const int st = R8(base, kWork + 0x3af);
+    const uint16_t md = R16(base, kModeCur);
+    if (md != last_mode || st != last_stage) {
+      REXKRNL_INFO("story4p: route mode {} stage {} next {}", (int)md, st, (int)R8(base, kWork + 0x3b0));
+      last_mode = md;
+      last_stage = st;
+    }
+  }
   if (quick < 0) return;
   const uint16_t cur = R16(base, kModeCur);
   if (cur != last) {
@@ -2039,3 +2170,52 @@ void Story4pCreateOverlay(rex::ui::ImGuiDrawer* drawer) {
   if (Enabled()) new WaitOverlay(drawer);
 }
 #endif
+
+// Route choice menu (constructor 0x824D0EF8: r3 = menu, r4 = menu id 0..18; tables at 0x82915408,
+// option index at +0xB84, chosen stage written to work+0x3B0 when A is pressed).
+// GH_ROUTE="id:opt,id:opt,...": preselect option opt of menu id (tests confirm it with the automatic A).
+REX_HOOK_RAW(sub_824D0EF8) {
+  const uint32_t menu = ctx.r3.u32;
+  const int id = (int)ctx.r4.s32;
+  __imp__sub_824D0EF8(ctx, base);
+  int opt = -1;
+  if (const char* r = Env("GH_ROUTE")) {
+    for (const char* q = r; *q;) {
+      int a = std::atoi(q);
+      const char* c = std::strchr(q, ':');
+      if (!c) break;
+      if (a == id) { opt = std::atoi(c + 1); break; }
+      const char* n = std::strchr(c, ',');
+      if (!n) break;
+      q = n + 1;
+    }
+  }
+  const int count = (id >= 0 && id < 19) ? (int)R32(base, 0x8291540C + id * 8) : 0;
+  if (opt >= count) opt = count - 1;
+  if (opt > 0) W32(base, menu + 0xB84, (uint32_t)opt);
+  std::string opts;
+  const uint32_t tab = (id >= 0 && id < 19) ? R32(base, 0x82915408 + id * 8) : 0;
+  for (int i = 0; i < count; i++) opts += fmt::format(" {}", (int)R16(base, tab + i * 4));
+  REXKRNL_INFO("story4p: route menu {} at stage {} options{} preselect {}", id, (int)R8(base, kWork + 0x3af),
+               opts, opt < 0 ? 0 : opt);
+}
+
+// Breakable props: keep the list used by the walking AI (UpdateIdle).
+REX_HOOK_RAW(sub_824D3EC8) {
+  const uint32_t obj = ctx.r4.u32;
+  __imp__sub_824D3EC8(ctx, base);
+  AddProp(base, obj);
+}
+REX_HOOK_RAW(sub_824D3AF8) {
+  const uint32_t obj = ctx.r4.u32;
+  __imp__sub_824D3AF8(ctx, base);
+  AddProp(base, obj);
+}
+REX_HOOK_RAW(sub_82443550) {
+  RemoveProp(ctx.r3.u32);
+  __imp__sub_82443550(ctx, base);
+}
+REX_HOOK_RAW(sub_82443FF8) {
+  RemoveProp(ctx.r3.u32);
+  __imp__sub_82443FF8(ctx, base);
+}
