@@ -46,6 +46,7 @@ extern "C" REX_FUNC(__imp__sub_824E3618);   // in-stage "P2 joins" check
 extern "C" REX_FUNC(__imp__sub_82499F40);   // save party progress / checkpoint
 extern "C" REX_FUNC(__imp__sub_82498808);   // camera update (once per frame in a stage)
 extern "C" REX_FUNC(__imp__sub_82500658);   // parameter screen: next/previous hero index
+extern "C" REX_FUNC(__imp__sub_82500710);   // parameter screen: pick a hero index not used by the other panel
 extern "C" REX_FUNC(__imp__sub_824892C0);   // modes 5/6: parameter screen
 extern "C" REX_FUNC(__imp__sub_824D0EF8);   // route choice menu constructor
 extern "C" REX_FUNC(__imp__sub_82443478);   // stage prop base constructor (r3 = object)
@@ -294,11 +295,16 @@ void SpawnExtra(Guest& g, int p) {
   // A stage loads the sprite packs of party 0..2 and of its own cast (the five heroes only where
   // they appear as NPCs); load P3/P4's now, or they (and later creations) find no animation data.
   g(sub_824E5758, 0, (uint64_t)(int64_t)kind);
+  // Han: with work+0x3c4 bit 1 the game uses kind 7 ("hanu" pack) instead of 2 ("han"); the loader
+  // above already swaps it, and the party routine (sub_824E2970) creates kind 7 too. Creating kind 2
+  // here crashed in sub_82425830 (no animation data) when P3/P4 joined as Han mid-stage.
+  int make = kind;
+  if (kind == 2 && (R32(base, kWork + 0x3c4) & 2)) make = 7;
   g(sub_8243FCE0, params);
   W8(base, params + 1, 0);
   W16(base, params + 8, 0);                   // no brain: driven by its pad
   W8(base, params + 6, R8(base, blk + 0xe));  // level
-  const uint32_t ch = g(sub_8247ACC0, params, (uint64_t)kind, slot, 0x400000,
+  const uint32_t ch = g(sub_8247ACC0, params, (uint64_t)make, slot, 0x400000,
                         p == 2 ? 0x300000 : 0x900000);
   if (!ch) { REXKRNL_WARN("story4p: create failed for P{}", p + 1); return; }
 
@@ -834,7 +840,18 @@ void LogPlayers(uint8_t* base) {
 // Party creation: P3/P4 (party 3/4) are created after the original P1/P2.
 REX_HOOK_RAW(sub_824E2970) {
   if (!Enabled()) { __imp__sub_824E2970(ctx, base); return; }
-  Unpark(base);
+  if (g_join.active) {
+    // A join from inside a stage: the restart loaded the sprite packs while P2's seat was parked
+    // (empty), so P2's hero pack is missing unless the stage cast happens to use it. Load it now, or
+    // P2 is created without animation data and the game crashes (sub_82425830, read of 0x442).
+    const int8_t p2 = g_join.p2_kind;
+    Unpark(base);
+    if (p2 >= 0) {
+      PPCContext c = ctx;
+      Guest g(c, base);
+      g(sub_824E5758, 0, (uint64_t)(int64_t)p2);
+    }
+  }
   if (Env("GH_4P_AUTO") && S8(base, kKinds + 2) >= 0) {  // test mode: P3/P4 without joining
     for (int p = 2; p < MaxPlayers(); p++) {
       if (S8(base, KindOf(p)) >= 0) continue;
@@ -920,6 +937,32 @@ REX_HOOK_RAW(sub_82500658) {
     __imp__sub_82500658(c, base);
     ctx.r3 = c.r3;
   }
+}
+
+// Parameter screen hero pick (sub_82500710(screen, panel, index, next, step)): the initial pick
+// (step 0) only calls sub_82500658 when the index clashes with the other panel (P1), so P4 was
+// offered (and could take) P3's hero. Re-check the result against P1..P4 here.
+REX_HOOK_RAW(sub_82500710) {
+  if (!Enabled() || !g_join.active) { __imp__sub_82500710(ctx, base); return; }
+  const PPCContext in = ctx;
+  __imp__sub_82500710(ctx, base);
+  const uint32_t screen = in.r3.u32;
+  int idx = ctx.r3.s32;
+  for (int i = 0; i < 6; i++) {
+    bool clash = PanelTaken(base, idx);
+    for (int k = 0; k < 2; k++) {
+      if (k == in.r4.s32) continue;
+      const uint32_t panel = R32(base, screen + 0x1a630 + k * 4);
+      if (panel && (int32_t)R32(base, panel + 0x81c) == idx) clash = true;
+    }
+    if (!clash) break;
+    PPCContext c = in;
+    c.r4.s64 = idx;
+    c.r5 = in.r6;  // direction
+    __imp__sub_82500658(c, base);
+    idx = c.r3.s32;
+  }
+  ctx.r3.s64 = idx;
 }
 
 // Continue (sub_824E4308(stage), every frame): a downed P1/P2 spends a credit and gets up. It only
@@ -1278,7 +1321,8 @@ REX_HOOK_RAW(sub_82498808) {
     for (int p = 2; p < 4; p++) {
       const int kind = S8(base, KindOf(p));
       const uint32_t ch = kind >= 0 ? Chara(base, SlotFor(p)) : 0;
-      if (ch && R8(base, ch + 0x54) == kind && R8(base, ch + 0xE1) > 0) {
+      const int ck = ch ? R8(base, ch + 0x54) : -1;
+      if (ch && (ck == kind || (kind == 2 && ck == 7)) && R8(base, ch + 0xE1) > 0) {
         g_prog[p] = Prog{kind, R32(base, ch + 0xC0), R16(base, ch + 0xD6), R8(base, ch + 0xE1)};
         // The level-up (sub_82468E90) writes P1/P2's block at once; P3/P4's block did not follow, so
         // the next stage created them at the old level. Keep their block up to date here.
