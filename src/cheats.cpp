@@ -44,6 +44,12 @@ void rex_nx_load_settings(void);
 }
 #endif
 
+// 4-player story mode (story4p.cpp) shares these hooks; it calls the originals.
+extern "C" REX_FUNC(Story4pHook_sub_8248A1F0);
+extern "C" REX_FUNC(Story4pHook_sub_824DEA90);
+extern "C" REX_FUNC(Story4pHook_sub_824E4308);
+extern "C" REX_FUNC(Story4pHook_sub_82468FA8);
+
 namespace {
 constexpr uint32_t kGame = 0x829CBFE8;  // game state (what sub_82495B30 returns); +942 continues, +1672 player slots
 
@@ -265,7 +271,7 @@ REX_HOOK_RAW(sub_8248A1F0) {
 #if defined(__SWITCH__)
   static uint16_t last_state = 0xFFFF;
   GhApplyJump(ctx, base);
-  __imp__sub_8248A1F0(ctx, base);
+  Story4pHook_sub_8248A1F0(ctx, base);  // story4p.cpp, which calls the original
   const uint16_t now = REX_LOAD_U16(kMode);
   if (now != last_state) {
     std::printf("[gh] mode state %u -> %u (stage byte %u)\n", last_state, now, REX_LOAD_U8(kGame + 0x3AF));
@@ -273,14 +279,14 @@ REX_HOOK_RAW(sub_8248A1F0) {
     last_state = now;
   }
 #else
-  __imp__sub_8248A1F0(ctx, base);
+  Story4pHook_sub_8248A1F0(ctx, base);  // story4p.cpp, which calls the original
 #endif
 }
 
 
 REX_HOOK_RAW(sub_824DEA90) {
   ApplyCheats(ctx, base);
-  __imp__sub_824DEA90(ctx, base);
+  Story4pHook_sub_824DEA90(ctx, base);  // story4p.cpp, which calls the original
 }
 
 REX_HOOK_RAW(sub_82478988) {
@@ -299,7 +305,7 @@ REX_HOOK_RAW(sub_824411C0) {
 
 REX_HOOK_RAW(sub_824E4308) {
   RefillContinues(base);
-  __imp__sub_824E4308(ctx, base);
+  Story4pHook_sub_824E4308(ctx, base);  // story4p.cpp, which calls the original
   RefillContinues(base);
 }
 
@@ -309,7 +315,11 @@ REX_HOOK_RAW(sub_824E4308) {
     BeforeAttributeRebuild(ctx, base, ctx.r3.u32);       \
     __imp__##name(ctx, base);                            \
   }
-ATTRIBUTE_REBUILD(sub_82468FA8)
+// sub_82468FA8 is also hooked by story4p.cpp: call its handler, which calls the original.
+REX_HOOK_RAW(sub_82468FA8) {
+  BeforeAttributeRebuild(ctx, base, ctx.r3.u32);
+  Story4pHook_sub_82468FA8(ctx, base);
+}
 ATTRIBUTE_REBUILD(sub_824418C8)
 ATTRIBUTE_REBUILD(sub_824429A8)
 ATTRIBUTE_REBUILD(sub_82441248)

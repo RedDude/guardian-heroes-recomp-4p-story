@@ -57,6 +57,8 @@ extern "C" REX_FUNC(__imp__sub_82489160);   // mode 4: New Game screen
 extern "C" REX_FUNC(__imp__sub_825022D8);   // parameter screen constructor (this, join mode)
 extern "C" REX_FUNC(__imp__sub_824E4308);   // continue: downed P1/P2 spend a credit
 extern "C" REX_FUNC(__imp__sub_825CF040);   // XamInputGetState(pad, 1, state)
+extern "C" REX_FUNC(__imp__sub_8248A1F0);   // top-level mode machine (hook entry in cheats.cpp)
+extern "C" REX_FUNC(__imp__sub_824DEA90);   // pause menu update (hook entry in cheats.cpp)
 extern "C" REX_FUNC(sub_8243FCE0);  // init create-params struct
 extern "C" REX_FUNC(sub_8247ACC0);  // create character (params, kind, slot, x, z)
 extern "C" REX_FUNC(sub_824E5758);  // load the sprite pack of a kind now (stage, kind), as for P1/P2
@@ -969,7 +971,8 @@ REX_HOOK_RAW(sub_82500710) {
 // knows party 1/2 (registry slots 1/2, state words stage+0x171b8/bc, timers +0x171c0/c4), so it is
 // run a second time with P3/P4 swapped into those places. With no credit left the original ends the
 // game, for P3/P4 too.
-REX_HOOK_RAW(sub_824E4308) {
+// Hooked in cheats.cpp, which calls this in place of the original.
+extern "C" REX_FUNC(Story4pHook_sub_824E4308) {
   const uint32_t stage = ctx.r3.u32;
   PPCContext saved = ctx;
   if (Enabled()) {
@@ -1557,7 +1560,8 @@ REX_HOOK_RAW(sub_824E0C10) {
   REXKRNL_INFO("story4p: pause {:08X}, P3/P4 status windows {:08X} {:08X}", pause, g_extra[0], g_extra[1]);
 }
 
-REX_HOOK_RAW(sub_824DEA90) {
+// Hooked in cheats.cpp, which calls this in place of the original.
+extern "C" REX_FUNC(Story4pHook_sub_824DEA90) {
   const uint32_t pause = ctx.r3.u32;
   const bool mine = Enabled() && pause == g_pause && Story(base) && R8(base, pause) != 0;
   if (mine) PlacePauseWindows(base, pause);
@@ -1658,7 +1662,8 @@ struct Expose {
 
 }  // namespace
 
-REX_HOOK_RAW(sub_82468FA8) { Shadow s(base, ctx.r3.u32); __imp__sub_82468FA8(ctx, base); }
+// Hooked in cheats.cpp, which calls this in place of the original.
+extern "C" REX_FUNC(Story4pHook_sub_82468FA8) { Shadow s(base, ctx.r3.u32); __imp__sub_82468FA8(ctx, base); }
 REX_HOOK_RAW(sub_82468E90) { Shadow s(base, ctx.r3.u32); __imp__sub_82468E90(ctx, base); }
 REX_HOOK_RAW(sub_82512B90) { Shadow s(base, ctx.r3.u32); __imp__sub_82512B90(ctx, base); }
 
@@ -2079,7 +2084,8 @@ REX_HOOK_RAW(sub_82489160) {
   }
 }
 
-REX_HOOK_RAW(sub_8248A1F0) {
+// Hooked in cheats.cpp, which calls this in place of the original.
+extern "C" REX_FUNC(Story4pHook_sub_8248A1F0) {
   const PPCContext saved = ctx;
   __imp__sub_8248A1F0(ctx, base);
   static int quick = -2, trigger = 3;
