@@ -21,6 +21,7 @@
 //   * The camera (sub_82498808) frames every focus point that players register each frame
 //     (sub_8246B2D8 -> sub_82496BB0), so P3/P4 are framed once they are flagged as on screen.
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -1991,12 +1992,18 @@ int g_wait[3];               // queued pads, in the order they pressed
 int g_nwait;
 bool g_wait_chain;           // a mode 6 screen started from the queue is running
 std::atomic<int> g_wait_label[3];  // player number shown by the overlay (0 = nothing)
+std::atomic<int> g_press_label[3];  // "Player N press START": connected pads that have not joined yet
 
 void WaitPublish(int first_player) {
   for (int i = 0; i < 3; i++) g_wait_label[i] = i < g_nwait ? first_player + i : 0;
 }
 
+void PressClear() {
+  for (auto& l : g_press_label) l = 0;
+}
+
 void WaitClear() {
+  PressClear();
   g_nwait = 0;
   g_wait_chain = false;
   WaitPublish(0);
@@ -2017,6 +2024,18 @@ void WaitScan(Guest& g) {
     g_wait[g_nwait++] = pad;
     REXKRNL_INFO("story4p: pad {} waiting on the New Game screen", pad);
   }
+  // Connected pads that are neither seated nor queued: the overlay asks them to press START, with
+  // the seat they would get.
+  int n = 0;
+  for (int pad = 0; pad < 4 && n < 3; pad++) {
+    const int player = SeatedOnNewGame(base) + g_nwait + n + 1;
+    if (player > MaxPlayers()) break;
+    bool taken = S8(base, kPadKind + 0) == pad || S8(base, kPadKind + 1) == pad;
+    for (int i = 0; i < g_nwait; i++) taken |= g_wait[i] == pad;
+    if (taken || !(g(sub_82419C38, pad) & 1)) continue;
+    g_press_label[n++] = player;
+  }
+  for (int i = n; i < 3; i++) g_press_label[i] = 0;
 }
 
 // A queued pad that became P2 on the screen (it pressed START) leaves the queue.
@@ -2076,6 +2095,7 @@ REX_HOOK_RAW(sub_82489160) {
     WaitPublish(SeatedOnNewGame(base) + 1);
     return;
   }
+  PressClear();  // the screen ended
   if (now == 8 && g_nwait > 0) {
     Guest g(const_cast<PPCContext&>(saved), base);
     g_wait_chain = WaitNextJoin(g);
@@ -2216,7 +2236,8 @@ REX_HOOK_RAW(sub_82418928) {
 #include <imgui.h>
 #include <rex/ui/imgui_dialog.h>
 
-// "Player N is waiting" over the New Game screen and the join screens that follow it.
+// "Player N is waiting" over the New Game screen and the join screens that follow it, and at the
+// top of the New Game screen "Player N press START" for connected pads that have not joined.
 namespace {
 class WaitOverlay : public rex::ui::ImGuiDialog {
  public:
@@ -2224,6 +2245,7 @@ class WaitOverlay : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
+    DrawPressStart(io);
     char text[96];
     int len = 0;
     for (int i = 0; i < 3; i++) {
@@ -2243,6 +2265,36 @@ class WaitOverlay : public rex::ui::ImGuiDialog {
     if (ImGui::Begin("##gh4p_wait", nullptr, flags)) {
       ImGui::SetWindowFontScale(scale);
       ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+      ImGui::TextUnformatted(text);
+      ImGui::PopStyleColor();
+    }
+    ImGui::End();
+  }
+
+ private:
+  static constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+                                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                             ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoFocusOnAppearing;
+
+  void DrawPressStart(ImGuiIO& io) {
+    char text[96];
+    int len = 0;
+    for (int i = 0; i < 3; i++) {
+      const int n = g_press_label[i];
+      if (n <= 0) continue;
+      len += std::snprintf(text + len, sizeof(text) - len, "%sPlayer %d press START", len ? "    " : "", n);
+    }
+    if (!len) return;
+    const float scale = std::max(1.5f, io.DisplaySize.y / 280.0f);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    if (ImGui::Begin("##gh4p_press", nullptr, kFlags)) {
+      ImGui::SetWindowFontScale(scale);
+      // Blink (0.6 s on, 0.4 s off), like an arcade "press start".
+      const float a = std::fmod((float)ImGui::GetTime(), 1.0f) < 0.6f ? 1.0f : 0.35f;
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, a));
       ImGui::TextUnformatted(text);
       ImGui::PopStyleColor();
     }
